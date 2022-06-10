@@ -255,6 +255,7 @@ class Experiment(ABC):
             eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
             writer.write_scalars(step, eval_metrics)
 
+        if step % config.steps_per_img == 0 or is_last_step or step == 1000:
             # print out a batch of images
             metrics = flax_utils.unreplicate(metrics)
             images = metrics['images']

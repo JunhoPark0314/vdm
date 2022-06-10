@@ -105,9 +105,12 @@ def create_train_dataset(
 
   dataset_builder = tfds.builder(task)
   dataset_builder.download_and_prepare()
-
-  train_split = deterministic_data.get_read_instruction_for_host(
-      "train", dataset_builder.info.splits["train"].num_examples)
+  train_split = tfds.split_for_jax_process(f'train[:{dataset_builder.info.splits["train"].num_examples}]',
+                process_index=jax.process_index(),
+                process_count=jax.process_count(),
+                drop_remainder=False)
+  # train_split = deterministic_data.get_read_instruction_for_host(
+  #     "train", dataset_builder.info.splits["train"].num_examples)
   batch_dims = [jax.local_device_count(), substeps, per_device_batch_size]
 
   train_ds = deterministic_data.create_dataset(
@@ -136,8 +139,12 @@ def create_eval_dataset(
 
   dataset_builder = tfds.builder(task)
 
-  eval_split = deterministic_data.get_read_instruction_for_host(
-      subset, dataset_builder.info.splits[subset].num_examples)
+  # eval_split = deterministic_data.get_read_instruction_for_host(
+  #     subset, dataset_builder.info.splits[subset].num_examples)
+  eval_split = tfds.split_for_jax_process(f'{subset}[:{dataset_builder.info.splits[subset].num_examples}]',
+                process_index=jax.process_index(),
+                process_count=jax.process_count(),
+                drop_remainder=False)
   batch_dims = [jax.local_device_count(), per_device_batch_size]
 
   eval_ds = deterministic_data.create_dataset(

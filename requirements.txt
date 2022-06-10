@@ -1,13 +1,13 @@
 absl-py
 clu
 flax
-#jax # TPU version installed separately
-#jaxlib # TPU version installed separately
+jax
+jaxlib==0.3.10+cuda11.cudnn805
 matplotlib
 ml_collections
 numpy
 tensorflow
-tensorflow-datasets
+tensorflow-datasets==4.6.0
 tensorflow-probability
 optax
 ipython

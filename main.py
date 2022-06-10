@@ -44,11 +44,11 @@ def main(argv):
 
   # Hide any GPUs from TensorFlow. Otherwise TF might reserve memory and make
   # it unavailable to JAX. (Not necessary with TPU.)
-  #tf.config.experimental.set_visible_devices([], "GPU")
+  tf.config.experimental.set_visible_devices([], "GPU")
 
   logging.info("JAX process: %d / %d",
                jax.process_index(), jax.process_count())
-  #logging.info("JAX devices: %r", jax.devices())
+  logging.info("JAX devices: %r", jax.devices())
 
   if FLAGS.model == "vdm":
     experiment = vdm.experiment_vdm.Experiment_VDM(FLAGS.config)

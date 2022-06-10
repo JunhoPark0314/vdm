@@ -179,7 +179,7 @@ class CustomLoggingWriter(LoggingWriter):
     # Convert jax DeviceArrays and numpy ndarrays to python native type
     values = [np.array(v).item() for v in values]
     # Print floats
-    values = [f"{v:.4f}" if isinstance(v, float) else f"{v}" for v in values]
+    values = [f"{k} : {v:.4f}" if isinstance(v, float) else f"{v}" for k, v in zip(keys, values)]
     logging.info("%d, %s", step, ", ".join(values))
 
   def write_texts(self, step: int, texts: Mapping[str, str]):
