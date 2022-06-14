@@ -35,7 +35,10 @@ import numpy as np
 from pprint import pformat
 
 
-def get_workdir():
+def get_workdir(base):
+  if os.path.isdir(os.path.join(base, 'checkpoints-0')):
+    return base
+
   argv = sys.argv
   config_list = []
   config_list.append(time.strftime('%Y%m%d-%H%M%S'))
@@ -53,7 +56,7 @@ def get_workdir():
       config_list.append(cfg)
   workdir = "-".join(config_list)
 
-  return os.path.join(config_file, workdir)
+  return os.path.join(base, config_file, workdir)
 
 
 def dist(fn, accumulate: str, axis_name='batch'):

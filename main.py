@@ -54,7 +54,7 @@ def main(argv):
     experiment = vdm.experiment_vdm.Experiment_VDM(FLAGS.config)
 
   if FLAGS.mode == "train":
-    workdir = os.path.join(FLAGS.workdir, get_workdir())
+    workdir = get_workdir(FLAGS.workdir)
     logging.info("Training at workdir: "+FLAGS.workdir)
     experiment.train_and_evaluate(workdir)
   elif FLAGS.mode == "eval":

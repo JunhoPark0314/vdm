@@ -1,8 +1,8 @@
 absl-py
 clu
 flax
-jax
-jaxlib==0.3.10+cuda11.cudnn805
+jax==0.3.10
+#jaxlib==0.3.10+cuda11.cudnn805 
 matplotlib
 ml_collections
 numpy
