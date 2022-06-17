@@ -97,6 +97,11 @@ class Experiment(ABC):
     self.p_sample = utils.dist(
         self.p_sample, accumulate='concat', axis_name='batch')
 
+    if self.config.model.sm_n_timesteps >0:
+      self.T_list = [self.config.model.sm_n_timesteps, -1]
+    else:
+      self.T_list = [10, 100, 250, 500, 1000, -1]
+
     logging.info('=== Done with Experiment.__init__ ===')
 
   def get_lr_schedule(self):
@@ -162,7 +167,7 @@ class Experiment(ABC):
     ...
 
   @abstractmethod
-  def loss_fn(self, params, batch, rng, is_train) -> Tuple[float, Any]:
+  def loss_fn(self, params, batch, rng, is_train, T_eval) -> Tuple[float, Any]:
     """Loss function and metrics."""
     ...
 
@@ -190,6 +195,7 @@ class Experiment(ABC):
 
     # Distribute training.
     state = flax_utils.replicate(state)
+    T_list = self.T_list
 
     # Create logger/writer
     writer = utils.create_custom_writer(workdir, jax.process_index())
@@ -215,7 +221,10 @@ class Experiment(ABC):
         is_last_step = step + substeps >= config.num_steps_train
         # One training step
         with jax.profiler.StepTraceAnnotation('train', step_num=step):
-          batch = jax.tree_map(jnp.asarray, next(self.train_iter))
+          batch = next(self.train_iter)
+          B = batch["images"].shape[0]
+          batch.update({"T_eval": tf.ones((B, substeps, 1)) * T_list[-1]})
+          batch = jax.tree_map(jnp.asarray, batch)
           state, _train_metrics = self.p_train_step(state, batch)
 
         # Quick indication that training is happening.
@@ -242,26 +251,30 @@ class Experiment(ABC):
         if step % config.steps_per_eval == 0 or is_last_step or step == 1000:
           logging.debug('=== Running eval ===')
           with report_progress.timed('eval'):
-            eval_metrics = []
-            for eval_step in range(config.num_steps_eval):
-              batch = self.eval_iter.next()
-              batch = jax.tree_map(jnp.asarray, batch)
-              metrics = self.p_eval_step(
-                  state.ema_params, batch, flax_utils.replicate(eval_step))
-              eval_metrics.append(metrics['scalars'])
+            for t in T_list[:-1]:
+              eval_metrics = []
+              for eval_step in range(config.num_steps_eval):
+                batch = self.eval_iter.next()
+                batch.update({"T_eval": tf.ones((B, 1)) * t})
+                batch = jax.tree_map(jnp.asarray, batch)
+                metrics = self.p_eval_step(
+                    state.ema_params, batch, flax_utils.replicate(eval_step))
+                eval_metrics.append(metrics[f'scalars'])
 
-            # average over eval metrics
-            eval_metrics = utils.get_metrics(eval_metrics)
-            eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
-            writer.write_scalars(step, eval_metrics)
+              # average over eval metrics
+              eval_metrics = utils.get_metrics(eval_metrics)
+              eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
+              eval_metrics = {k + f'/{t:05d}':v for (k, v) in eval_metrics.items()}
+              writer.write_scalars(step, eval_metrics)
 
         if step % config.steps_per_img == 0 or is_last_step or step == 1000:
             # print out a batch of images
             metrics = flax_utils.unreplicate(metrics)
             images = metrics['images']
-            samples = self.p_sample(params=state.ema_params)
-            samples = utils.generate_image_grids(samples)[None, :, :, :]
-            images['samples'] = samples.astype(np.uint8)
+            for t in T_list[:-1]:
+              samples = self.p_sample(params=state.ema_params, T=flax_utils.replicate(t))
+              samples = utils.generate_image_grids(samples)[None, :, :, :]
+              images[f'samples/{t:05d}'] = samples.astype(np.uint8)
             writer.write_images(step, images)
 
         if step % config.steps_per_save == 0 or is_last_step:
