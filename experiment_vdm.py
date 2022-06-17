@@ -19,7 +19,8 @@ import jax
 from typing import Any, Tuple
 
 from vdm.experiment import Experiment
-import vdm.model_vdm
+import vdm.model_vdm_conv as model_vdm_conv
+import vdm.model_vdm_base as model_vdm_base
 
 
 class Experiment_VDM(Experiment):
@@ -27,8 +28,13 @@ class Experiment_VDM(Experiment):
 
   def get_model_and_params(self, rng: PRNGKey):
     config = self.config
-    config = vdm.model_vdm.VDMConfig(**config.model)
-    model = vdm.model_vdm.VDM(config)
+    if config.model.name == "base":
+      model_vdm = model_vdm_base
+    elif config.model.name == "conv":
+      model_vdm = model_vdm_conv
+
+    config = model_vdm.VDMConfig(**config.model)
+    model = model_vdm.VDM(config)
 
     inputs = {"images": jnp.zeros((2, 32, 32, 3), "uint8")}
     inputs["conditioning"] = jnp.zeros((2,))
