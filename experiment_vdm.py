@@ -38,6 +38,7 @@ class Experiment_VDM(Experiment):
 
     inputs = {"images": jnp.zeros((2, 32, 32, 3), "uint8")}
     inputs["conditioning"] = jnp.zeros((2,))
+    inputs["T_eval"] = -jnp.ones((1,))
     rng1, rng2 = jax.random.split(rng)
     params = model.init({"params": rng1, "sample": rng2}, **inputs)
     return model, params
@@ -55,6 +56,7 @@ class Experiment_VDM(Experiment):
         **inputs,
         rngs=rngs,
         deterministic=not is_train,
+        use_t_eval=not is_train,
     )
 
     rescale_to_bpd = 1./(np.prod(inputs["images"].shape[1:]) * np.log(2.))
@@ -75,13 +77,13 @@ class Experiment_VDM(Experiment):
 
     return bpd, metrics
 
-  def sample_fn(self, *, dummy_inputs, rng, params):
+  def sample_fn(self, *, dummy_inputs, rng, params, T):
     rng = jax.random.fold_in(rng, jax.lax.axis_index('batch'))
 
-    if self.model.config.sm_n_timesteps > 0:
-      T = self.model.config.sm_n_timesteps
-    else:
-      T = 1000
+    # if self.model.config.sm_n_timesteps > 0:
+    #   T = self.model.config.sm_n_timesteps
+    # else:
+    #   T = 1000
 
     conditioning = jnp.zeros((dummy_inputs.shape[0],), dtype='uint8')
 
