@@ -41,7 +41,7 @@ def get_config():
       with_attention=False,
 
       # configurations of the noise schedule
-      gamma_type='learnable_scalar',  # learnable_scalar / learnable_nnet / fixed
+      gamma_type='learnable_nnet',  # learnable_scalar / learnable_nnet / fixed
       gamma_min=-13.3,
       gamma_max=5.,
 
@@ -58,11 +58,12 @@ def get_config():
       num_steps_lr_warmup=100,
       num_steps_train=10_000_000,
       num_steps_eval=100,
-      batch_size_train=128,
+      batch_size_train=256,
       batch_size_eval=128,
       steps_per_logging=1000,
-      steps_per_eval=10_000,
-      steps_per_save=10_000,
+      steps_per_eval=2000,
+      steps_per_save=1000,
+      steps_per_img=10_000,
       profile=False,
   )
 
