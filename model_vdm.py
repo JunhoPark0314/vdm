@@ -35,7 +35,6 @@ class VDMConfig:
   gamma_type: str
   gamma_min: float
   gamma_max: float
-  gamma_out: int
 
   # configurations of the score model
   sm_n_timesteps: int
@@ -43,35 +42,9 @@ class VDMConfig:
   sm_n_layer: int
   sm_pdrop: float
   sm_kernel_init: Callable = jax.nn.initializers.normal(0.02)
-  gamma_shape: tuple = (1,1)
-
 
 
 ######### Latent VDM model #########
-def conv_gamma(gamma, f, square=False):
-  if len(f.shape) == 4:
-    N,H,W,C = f.shape
-    D = 1
-    ft = f.transpose(3,1,2,0)
-    G = int(N / gamma.shape[0])
-  elif len(f.shape) == 5:
-    N,H,W,C,D = f.shape
-    ft = f.transpose(3,1,2,0,4).reshape(C,H,W,N*D)
-    G = int(N*D / gamma.shape[0])
-  
-  # normalizer = np.sqrt(np.prod(gamma.shape[1:]))
-  fft_ft = jnp.fft.rfft2(ft, axes=[1,2])
-  if square:
-    fft_ft = jnp.square(jnp.absolute(fft_ft))
-  ft = jnp.fft.irfft2(fft_ft * jnp.repeat(gamma, G, axis=0).transpose(3,1,2,0), axes=[1, 2])
-  # ft = jax.lax.conv_general_dilated(ft, jnp.repeat(gamma, G, axis=0), window_strides=(1,1), padding="SAME", 
-  #   feature_group_count=N*D,dimension_numbers=("NHWC", "OIHW", "NHWC"))
-
-  if len(f.shape) == 4:
-    ft = ft.transpose(3,1,2,0)
-  elif len(f.shape) == 5:
-    ft = ft.reshape(C, H, W, N, D).transpose(3,1,2,0,4)
-  return ft #/ normalizer
 
 @flax.struct.dataclass
 class VDMOutput:
@@ -94,16 +67,15 @@ class VDM(nn.Module):
       self.gamma = NoiseSchedule_FixedLinear(self.config)
     elif self.config.gamma_type == 'learnable_scalar':
       self.gamma = NoiseSchedule_Scalar(self.config)
-    if self.config.gamma_type == 'learnable_fft_nnet':
-      self.gamma = NoiseSchedule_FFT_NNet(self.config)
     else:
       raise Exception("Unknown self.var_model")
-  
-  def __call__(self, images, conditioning, deterministic: bool = True):
+
+  def __call__(self, images, conditioning, T_eval, deterministic: bool = True, use_t_eval: bool = False):
     g_0, g_1 = self.gamma(0.), self.gamma(1.)
     var_0, var_1 = nn.sigmoid(g_0), nn.sigmoid(g_1)
     x = images
     n_batch = images.shape[0]
+    t_eval = T_eval
 
     # encode
     f = self.encdec.encode(x)
@@ -111,17 +83,14 @@ class VDM(nn.Module):
     # 1. RECONSTRUCTION LOSS
     # add noise and reconstruct
     eps_0 = jax.random.normal(self.make_rng("sample"), shape=f.shape)
-    # z_0 = jnp.sqrt(1. - var_0) * f + jnp.sqrt(var_0) * eps_0
-    # z_0_rescaled = f + jnp.exp(0.5 * g_0) * eps_0 # = z_0/sqrt(1-var)
-    z_0_rescaled = f + conv_gamma(jnp.exp(0.5 * g_0), eps_0) # = z_0/sqrt(1-var)
+    z_0 = jnp.sqrt(1. - var_0) * f + jnp.sqrt(var_0) * eps_0
+    z_0_rescaled = f + jnp.exp(0.5 * g_0) * eps_0  # = z_0/sqrt(1-var)
     loss_recon = - self.encdec.logprob(x, z_0_rescaled, g_0)
 
     # 2. LATENT LOSS
     # KL z1 with N(0,1) prior
-    # mean1_sqr = (1. - var_1) * jnp.square(f)
-    mean1_sqr = jnp.fft.rfft2(conv_gamma((1. - var_1), f), axes=[1,2]) / f.shape[1]
-    loss_klz = 0.5 * jnp.sum(jnp.square(mean1_sqr.real) + jnp.square(mean1_sqr.imag) + var_1 - jnp.log(var_1) - 1., axis=(1, 2, 3))
-    # loss_klz = jnp.fft.ifft2(loss_klz, axes=[1,2])
+    mean1_sqr = (1. - var_1) * jnp.square(f)
+    loss_klz = 0.5 * jnp.sum(mean1_sqr + var_1 - jnp.log(var_1) - 1., axis=(1, 2, 3))
 
     # 3. DIFFUSION LOSS
     # sample time steps
@@ -136,22 +105,21 @@ class VDM(nn.Module):
     if self.config.sm_n_timesteps > 0:
       T = self.config.sm_n_timesteps
       t = jnp.ceil(t * T) / T
+    if use_t_eval:
+      T = t_eval
+      t = jnp.ceil(t * T) / T
 
     # sample z_t
     g_t = self.gamma(t)
-    # var_t = nn.sigmoid(g_t)[:, None, None, None]
-    var_t = nn.sigmoid(g_t)#[:, None, None, None]
+    var_t = nn.sigmoid(g_t)[:, None, None, None]
     eps = jax.random.normal(self.make_rng("sample"), shape=f.shape)
-    # z_t = jnp.sqrt(1. - var_t) * f + jnp.sqrt(var_t) * eps
-    z_t = conv_gamma(jnp.sqrt(1. - var_t), f) + conv_gamma(jnp.sqrt(var_t), eps)
+    z_t = jnp.sqrt(1. - var_t) * f + jnp.sqrt(var_t) * eps
     # compute predicted noise
     eps_hat = self.score_model(z_t, g_t, conditioning, deterministic)
     # compute MSE of predicted noise
-    # loss_diff_mse = jnp.sum(jnp.square(eps - eps_hat), axis=[1, 2, 3])
-    loss_diff_mse = jnp.fft.rfft2(eps - eps_hat, axes=[1,2]) / f.shape[1]
-    loss_diff_mse = jnp.square(loss_diff_mse.real) + jnp.square(loss_diff_mse.imag)
+    loss_diff_mse = jnp.sum(jnp.square(eps - eps_hat), axis=[1, 2, 3])
 
-    if self.config.sm_n_timesteps == 0:
+    if (self.config.sm_n_timesteps == 0) and (use_t_eval == False):
       # loss for infinite depth T, i.e. continuous time
       _, g_t_grad = jax.jvp(self.gamma, (t,), (jnp.ones_like(t),))
       loss_diff = .5 * g_t_grad * loss_diff_mse
@@ -161,16 +129,14 @@ class VDM(nn.Module):
       g_s = self.gamma(s)
       loss_diff = .5 * T * jnp.expm1(g_t - g_s) * loss_diff_mse
 
-    loss_diff = jnp.sum(loss_diff, axis=[1, 2, 3])
-
     # End of diffusion loss computation
 
     return VDMOutput(
         loss_recon=loss_recon,
         loss_klz=loss_klz,
         loss_diff=loss_diff,
-        var_0=jnp.linalg.norm(var_0) / np.sqrt(self.config.gamma_out),
-        var_1=jnp.linalg.norm(var_1) / np.sqrt(self.config.gamma_out),
+        var_0=var_0,
+        var_1=var_1,
     )
 
   def sample(self, i, T, z_t, conditioning, rng):
@@ -183,21 +149,16 @@ class VDM(nn.Module):
     g_s, g_t = self.gamma(s), self.gamma(t)
     eps_hat = self.score_model(
         z_t,
-        # g_t * jnp.ones((z_t.shape[0],), g_t.dtype),
-        g_t,
+        g_t * jnp.ones((z_t.shape[0],), g_t.dtype),
         conditioning,
         deterministic=True)
     a = nn.sigmoid(-g_s)
     b = nn.sigmoid(-g_t)
     c = - jnp.expm1(g_s - g_t)
     sigma_t = jnp.sqrt(nn.sigmoid(g_t))
-    alpha_st = jnp.sqrt(nn.sigmoid(-g_s) / nn.sigmoid(-g_t))
 
-    # z_s = jnp.sqrt(nn.sigmoid(-g_s) / nn.sigmoid(-g_t)) * (z_t - sigma_t * c * eps_hat) + \
-    #     jnp.sqrt((1. - a) * c) * eps
-    z_s = conv_gamma(alpha_st, z_t) + \
-        (- conv_gamma(alpha_st * sigma_t * c , eps_hat)) + \
-        conv_gamma(jnp.sqrt((1. - a) * c) ,eps)
+    z_s = jnp.sqrt(nn.sigmoid(-g_s) / nn.sigmoid(-g_t)) * (z_t - sigma_t * c * eps_hat) + \
+        jnp.sqrt((1. - a) * c) * eps
 
     return z_s
 
@@ -205,8 +166,7 @@ class VDM(nn.Module):
     g_0 = self.gamma(0.)
 
     var_0 = nn.sigmoid(g_0)
-    # z_0_rescaled = z_0 / jnp.sqrt(1. - var_0)
-    z_0_rescaled = conv_gamma(1 / jnp.sqrt(1. - var_0), z_0)
+    z_0_rescaled = z_0 / jnp.sqrt(1. - var_0)
 
     logits = self.encdec.decode(z_0_rescaled, g_0)
 
@@ -246,10 +206,8 @@ class EncDec(nn.Module):
     x_vals = jnp.arange(0, config.vocab_size)[:, None]
     x_vals = jnp.repeat(x_vals, 3, 1)
     x_vals = self.encode(x_vals).transpose([1, 0])[None, None, None, :, :]
-    # inv_stdev = jnp.exp(-0.5 * g_0[..., None])
-    # logits = -0.5 * jnp.square((z[..., None] - x_vals) * inv_stdev)
-    inv_stdev = jnp.exp(-0.5 * g_0)
-    logits = -0.5 * jnp.square(conv_gamma(inv_stdev, (z[..., None] - x_vals)))
+    inv_stdev = jnp.exp(-0.5 * g_0[..., None])
+    logits = -0.5 * jnp.square((z[..., None] - x_vals) * inv_stdev)
 
     logprobs = jax.nn.log_softmax(logits)
     return logprobs
@@ -279,14 +237,13 @@ class ScoreUNet(nn.Module):
     ub = config.gamma_max
     t = (g_t - lb) / (ub - lb)  # ---> [0,1]
 
-    # assert jnp.isscalar(t) or len(t.shape) == 0 or len(t.shape) == 1
-    # if jnp.isscalar(t):
-    #   t = jnp.ones((z.shape[0],), z.dtype) * t
-    # elif len(t.shape) == 0:
-    #   t = jnp.tile(t[None], z.shape[0])
-    G = int(z.shape[0] / t.shape[0])
+    assert jnp.isscalar(t) or len(t.shape) == 0 or len(t.shape) == 1
+    if jnp.isscalar(t):
+      t = jnp.ones((z.shape[0],), z.dtype) * t
+    elif len(t.shape) == 0:
+      t = jnp.tile(t[None], z.shape[0])
 
-    temb = get_timestep_embedding(jnp.repeat(t, G, axis=0).reshape(z.shape[0], -1), n_embd)
+    temb = get_timestep_embedding(t, n_embd)
     cond = jnp.concatenate([temb, conditioning[:, None]], axis=1)
     cond = nn.swish(nn.Dense(features=n_embd * 4, name='dense0')(cond))
     cond = nn.swish(nn.Dense(features=n_embd * 4, name='dense1')(cond))
@@ -356,14 +313,13 @@ def get_timestep_embedding(timesteps, embedding_dim: int, dtype=jnp.float32):
   Returns:
     embedding vectors with shape `(len(timesteps), embedding_dim)`
   """
-  # assert len(timesteps.shape) == 1
+  assert len(timesteps.shape) == 1
   timesteps *= 1000.
 
   half_dim = embedding_dim // 2
-  # emb = np.log(10000) / (half_dim - 1)
-  # emb = jnp.exp(jnp.arange(half_dim, dtype=dtype) * -emb)
-  # emb = timesteps.astype(dtype)[:, None] * emb[None, :]
-  emb = DenseExp(half_dim,name='pos_dense')(timesteps.astype(dtype))
+  emb = np.log(10000) / (half_dim - 1)
+  emb = jnp.exp(jnp.arange(half_dim, dtype=dtype) * -emb)
+  emb = timesteps.astype(dtype)[:, None] * emb[None, :]
   emb = jnp.concatenate([jnp.sin(emb), jnp.cos(emb)], axis=1)
   if embedding_dim % 2 == 1:  # zero pad
     emb = jax.lax.pad(emb, dtype(0), ((0, 0, 0), (0, 1, 0)))
@@ -379,14 +335,12 @@ class NoiseSchedule_Scalar(nn.Module):
   def setup(self):
     init_bias = self.config.gamma_min
     init_scale = self.config.gamma_max - init_bias
-    self.gamma_shape = self.config.gamma_shape
     self.w = self.param('w', constant_init(init_scale), (1,))
     self.b = self.param('b', constant_init(init_bias), (1,))
 
   @nn.compact
   def __call__(self, t):
-    gamma = self.b + abs(self.w) * t
-    return gamma.reshape((gamma.shape[0],1)+self.gamma_shape)
+    return self.b + abs(self.w) * t
 
 
 class NoiseSchedule_FixedLinear(nn.Module):
@@ -406,8 +360,7 @@ class NoiseSchedule_NNet(nn.Module):
   def setup(self):
     config = self.config
 
-    self.gamma_shape = config.gamma_shape
-    n_out = int(np.prod(self.gamma_shape))
+    n_out = 1
     kernel_init = nn.initializers.normal()
 
     init_bias = self.config.gamma_min
@@ -437,51 +390,7 @@ class NoiseSchedule_NNet(nn.Module):
       _h = self.l3(_h) / self.n_features
       h += _h
 
-    # return jnp.squeeze(h, axis=-1)
-    return h.reshape((h.shape[0], 1) + self.gamma_shape)
-
-class NoiseSchedule_FFT_NNet(nn.Module):
-  config: VDMConfig
-  n_features: int = 1024
-  nonlinear: bool = True
-
-  def setup(self):
-    config = self.config
-
-    self.gamma_shape = config.gamma_shape
-    # n_out = int(np.prod(self.gamma_shape))
-    n_out = config.gamma_out
-    kernel_init = nn.initializers.normal()
-
-    init_bias = self.config.gamma_min
-    init_scale = self.config.gamma_max - init_bias
-
-    self.freq = self.param('freq', nn.initializers.uniform(1.0), (1, n_out, 2))
-    self.l1 = DenseMonotone(n_out,
-                            kernel_init=constant_init(init_scale),
-                            bias_init=constant_init(init_bias))
-    if self.nonlinear:
-      self.l2 = DenseMonotone(self.n_features, kernel_init=kernel_init)
-      self.l3 = DenseMonotone(n_out, kernel_init=kernel_init, use_bias=False)
-  
-  @nn.compact
-  def __call__(self, t, det_min_max=False):
-    assert jnp.isscalar(t) or len(t.shape) == 0 or len(t.shape) == 1
-
-    if jnp.isscalar(t) or len(t.shape) == 0:
-      t = t * jnp.ones((1, 1))
-    else:
-      t = jnp.reshape(t, (-1, 1))
-
-    h = self.l1(t)
-    if self.nonlinear:
-      _h = 2. * (t - .5)  # scale input to [-1, +1]
-      _h = self.l2(_h)
-      _h = 2 * (nn.sigmoid(_h) - .5)  # more stable than jnp.tanh(h)
-      _h = self.l3(_h) / self.n_features
-      h += _h
-
-    return h.reshape((h.shape[0],) + self.gamma_shape + (1,))
+    return jnp.squeeze(h, axis=-1)
 
 
 def constant_init(value, dtype='float32'):
@@ -509,20 +418,6 @@ class DenseMonotone(nn.Dense):
       y = y + bias
     return y
 
-class DenseExp(nn.Dense):
-  @nn.compact
-  def __call__(self, inputs):
-    inputs = jnp.asarray(inputs, self.dtype)
-    exp_bias = np.log(10000) / (self.features - 1)
-    kernel = self.param('kernel',
-                        self.kernel_init,
-                        (inputs.shape[-1], self.features))
-    # kernel = abs(jnp.asarray(kernel, self.dtype))
-    kernel = jnp.exp(jnp.asarray(kernel, self.dtype) * (-exp_bias))
-    y = jax.lax.dot_general(inputs, kernel,
-                            (((inputs.ndim - 1,), (0,)), ((), ())),
-                            precision=self.precision)
-    return y
 
 ######### ResNet block #########
 

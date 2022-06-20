@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from abc import ABC, abstractmethod
+from collections import defaultdict
 import functools
 import os
 from typing import Any, Tuple
@@ -34,6 +35,9 @@ import numpy as np
 import optax
 from optax._src import base
 import tensorflow as tf
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from scipy.stats import gaussian_kde
 
 import vdm.train_state
 import vdm.utils as utils
@@ -86,9 +90,13 @@ class Experiment(ABC):
     self.p_train_step = functools.partial(jax.lax.scan, self.p_train_step)
     self.p_train_step = jax.pmap(self.p_train_step, "batch")
 
-    self.rng, eval_rng, sample_rng = jax.random.split(self.rng, 3)
+    self.rng, eval_rng, sample_rng, seq_rng, mse_rng = jax.random.split(self.rng, 5)
     self.p_eval_step = functools.partial(self.eval_step, eval_rng)
     self.p_eval_step = jax.pmap(self.p_eval_step, "batch")
+
+    self.p_mse_step = functools.partial(self.mse_step, mse_rng)
+    self.p_mse_step = jax.pmap(self.p_mse_step, "batch")
+
     self.p_sample = functools.partial(
         self.sample_fn,
         dummy_inputs=next(self.eval_iter)["images"][0],
@@ -96,6 +104,16 @@ class Experiment(ABC):
     )
     self.p_sample = utils.dist(
         self.p_sample, accumulate='concat', axis_name='batch')
+
+    self.p_sample_seq = functools.partial(
+        self.sample_fn,
+        dummy_inputs=next(self.eval_iter)["images"][0],
+        rng=seq_rng,
+        return_seq=True
+    )
+    self.p_sample_seq = utils.dist(
+        self.p_sample_seq, accumulate='concat', axis_name='batch')
+
 
     if self.config.model.sm_n_timesteps >0:
       self.T_list = [self.config.model.sm_n_timesteps, -1]
@@ -162,12 +180,17 @@ class Experiment(ABC):
     ...
 
   @abstractmethod
-  def sample_fn(self, *, dummy_inputs, rng, params) -> chex.Array:
+  def sample_fn(self, *, dummy_inputs, rng, T, params) -> chex.Array:
     """Generate a batch of samples in [0, 255]. """
     ...
 
   @abstractmethod
   def loss_fn(self, params, batch, rng, is_train, T_eval) -> Tuple[float, Any]:
+    """Loss function and metrics."""
+    ...
+
+  @abstractmethod
+  def mse_fn(self, params, batch, rng, is_train, T_eval) -> Tuple[float, Any]:
     """Loss function and metrics."""
     ...
 
@@ -272,7 +295,7 @@ class Experiment(ABC):
             metrics = flax_utils.unreplicate(metrics)
             images = metrics['images']
             for t in T_list[:-1]:
-              samples = self.p_sample(params=state.ema_params, T=flax_utils.replicate(t))
+              samples = self.p_sample(params=state.ema_params, T=flax_utils.replicate(jnp.ones([t,0])))
               samples = utils.generate_image_grids(samples)[None, :, :, :]
               images[f'samples/{t:05d}'] = samples.astype(np.uint8)
             writer.write_images(step, images)
@@ -293,32 +316,217 @@ class Experiment(ABC):
 
     # Distribute training.
     params = flax_utils.replicate(params)
+    T_list = self.T_list
 
     eval_logdir = os.path.join(workdir, 'eval')
     tf.io.gfile.makedirs(eval_logdir)
     writer = metric_writers.create_default_writer(
         eval_logdir, just_logging=jax.process_index() > 0)
 
-    eval_metrics = []
+    # for t in T_list[:-1]:
+    #   eval_metrics = []
+    #   for eval_step in range(self.config.training.num_steps_eval):
+    #     batch = self.eval_iter.next()
+    #     batch.update({"T_eval": tf.ones((B, 1)) * t})
+    #     batch = jax.tree_map(jnp.asarray, batch)
+    #     metrics = self.p_eval_step(
+    #         params, batch, flax_utils.replicate(eval_step))
+    #     eval_metrics.append(metrics['scalars'])
 
-    for eval_step in range(self.config.training.num_steps_eval):
-      batch = self.eval_iter.next()
-      batch = jax.tree_map(jnp.asarray, batch)
-      metrics = self.p_eval_step(
-          params, batch, flax_utils.replicate(eval_step))
-      eval_metrics.append(metrics['scalars'])
-
-    # average over eval metrics
-    eval_metrics = utils.get_metrics(eval_metrics)
-    eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
-
-    writer.write_scalars(step, eval_metrics)
+    #   # average over eval metrics
+    #   eval_metrics = utils.get_metrics(eval_metrics)
+    #   eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
+    #   eval_metrics = {k + f'/{t:05d}':v for (k, v) in eval_metrics.items()}
+    #   writer.write_scalars(step, eval_metrics)
 
     # sample a batch of images
-    samples = self.p_sample(params=params)
-    samples = utils.generate_image_grids(samples)[None, :, :, :]
-    samples = {'samples': samples.astype(np.uint8)}
-    writer.write_images(step, samples)
+
+    # images = {}
+    # T_list = [1, 2, 4]
+    # for t in T_list[:-1]:
+    #   seq_samples = self.p_sample_seq(params=params, T=flax_utils.replicate(jnp.ones([t,0])))
+    #   seq_samples = utils.generate_image_grids(seq_samples)[None, :, :, :]
+    #   # samples = {'samples': samples.astype(np.uint8)}
+    #   images[f'eval_samples/{t:05d}'] = seq_samples.astype(np.uint8)
+    # writer.write_images(step, images)
+
+    cm = ['b','r','g','y','c']
+    handles = []
+    for tl_i, tl in enumerate(T_list[:-1][::-1]):
+      handles.append(mpatches.Patch(color=cm[tl_i], label=f"{tl:05d}"))
+
+    # Plot MSE-Timestep Graph
+    plot_mse = False
+    if plot_mse:
+      plt.clf()
+      plt.figure("snr_four", figsize=(20, 20))
+      plt.figure("four", figsize=(20, 20))
+      plt.figure("mse", figsize=(20, 20))      
+
+
+      for ti, t in enumerate(T_list[:-1][-1:]):
+        metric_list = defaultdict(list)
+        for eval_step in range(self.config.training.num_steps_eval):
+            batch = self.eval_iter.next()
+            B = batch["images"].shape[0]
+            batch.update({"T_eval": tf.ones((B, 1)) * t})
+            batch = jax.tree_map(jnp.asarray, batch)
+            metrics = self.p_mse_step(
+                params, batch, flax_utils.replicate(eval_step))
+            for k, v in metrics.items():
+              metric_list[k].append(v.reshape(-1, *v.shape[2:]))
+        
+        for k, v in metric_list.items():
+          metric_list[k] = jnp.vstack(v)
+        mse = np.sqrt(metric_list["loss_diff_snr"].reshape(-1, 32, 32, 3))
+
+        plt.figure("mse")
+        x = metric_list["timesteps"].reshape(-1)
+        y = metric_list["alpha_t"].reshape(-1) / metric_list["sigma_t"].reshape(-1)
+        # xy = np.vstack([x,y])
+        # z = gaussian_kde(xy)(xy)
+        plt.subplot(2,2,1)
+        plt.scatter(x,np.log(y),s=2) #, c=cm[ti], label=f"{t:05d}")
+        plt.title('t-snr graph')
+        # plt.legend(handles=handles)
+        
+        plt.subplot(2,2,2)
+        mse = np.sqrt(metric_list["loss_diff"].reshape(-1, 32, 32, 3))
+        y = jnp.mean(mse, axis=[1,2,3])
+        plt.title('t-mse graph')
+        # plt.legend(handles=handles)
+        for ts in np.unique(x):
+          ts_x = x[x == ts]
+          ts_y = y[x == ts]
+          # xy = np.vstack([ts_x,ts_y])
+          if len(ts_y) > 1:
+            z = gaussian_kde(ts_y)(ts_y)
+            z = z / z.max()
+          else:
+            z = np.ones(len(ts_y))
+          # plt.scatter(ts_x,ts_y, alpha=z, c=cm[ti], s=2, label=f"{t:05d}")
+          plt.scatter(1-ts_x,ts_y, alpha=0.6, c=z, s=2)#,label=f"{t:05d}")
+          # plt.legend(handles=handles)
+
+        mse_snr_deriv = np.sqrt(metric_list["loss_diff"].reshape(-1, 32, 32, 3)) * metric_list["snr_deriv"].reshape(-1, 1, 1, 1)
+        y = jnp.mean(mse_snr_deriv, axis=[1,2,3])
+        plt.subplot(2,2,3)
+        plt.title('t-mse_snr` graph')
+        for ts in np.unique(x):
+          ts_x = x[x == ts]
+          ts_y = y[x == ts]
+          # xy = np.vstack([ts_x,ts_y])
+          if len(ts_y) > 1:
+            z = gaussian_kde(ts_y)(ts_y)
+            z = z / z.max()
+          else:
+            z = np.ones(len(ts_y))
+          # plt.scatter(ts_x,ts_y, alpha=z, c=cm[ti], s=2, label=f"{t:05d}")
+          plt.scatter(1 - ts_x,ts_y, alpha=0.6, c=z, s=2)#,label=f"{t:05d}")
+          # plt.legend(handles=handles)
+
+        mse_snr = np.sqrt(metric_list["loss_diff_snr"].reshape(-1, 32, 32, 3))
+        y = jnp.mean(mse_snr, axis=[1,2,3])
+        plt.subplot(2,2,4)
+        plt.title('t-mse_snr graph')
+        for ts in np.unique(x):
+          ts_x = x[x == ts]
+          ts_y = y[x == ts]
+          # xy = np.vstack([ts_x,ts_y])
+          if len(ts_y) > 1:
+            z = gaussian_kde(ts_y)(ts_y)
+            z = z / z.max()
+          else:
+            z = np.ones(len(ts_y))
+          # plt.scatter(ts_x,ts_y, alpha=z, c=cm[ti], s=2, label=f"{t:05d}")
+          plt.scatter(1 - ts_x,ts_y, alpha=0.6, c=z, s=2)#,label=f"{t:05d}")
+          # plt.legend(handles=handles)
+        
+        plt.figure("snr_four")
+        plt.title('t-mse_fourier graph')
+        y = jnp.fft.fft2(np.sqrt(mse_snr), axes=[1,2])
+        y = jnp.linalg.norm(jnp.fft.fftshift(jnp.absolute(y), axes=[1,2])[:,:,16,:], axis=-1)
+        for h_id in range(16):
+          plt.subplot(4, 4, h_id+1)
+          for ts in np.unique(x):
+            ts_x = x[x == ts]
+            ts_y = y[x == ts, 16 + h_id]
+            if len(ts_y) > 1:
+              z = gaussian_kde(ts_y)(ts_y)
+              # z = z / z.max()
+            else:
+              z = np.ones(len(ts_y))
+            # plt.scatter(ts_x, ts_y, alpha=z, c=cm[ti], s=2, label=f'{t:05d}')
+            plt.scatter(1 - ts_x, ts_y, alpha=0.6, c=z, s=2)#, label=f'{t:05d}')
+          plt.title(h_id)
+          # plt.legend(handles=handles)
+
+        plt.figure("four")
+        plt.title('t-mse_fourier graph')
+        y = jnp.fft.fft2(np.sqrt(mse_snr_deriv), axes=[1,2])
+        y = jnp.linalg.norm(jnp.fft.fftshift(jnp.absolute(y), axes=[1,2])[:,:,16,:], axis=-1)
+        for h_id in range(16):
+          plt.subplot(4, 4, h_id+1)
+          for ts in np.unique(x):
+            ts_x = x[x == ts]
+            ts_y = y[x == ts, 16 + h_id]
+            if len(ts_y) > 1:
+              z = gaussian_kde(ts_y)(ts_y)
+              # z = z / z.max()
+            else:
+              z = np.ones(len(ts_y))
+            # plt.scatter(ts_x, ts_y, alpha=z, c=cm[ti], s=2, label=f'{t:05d}')
+            plt.scatter(1 - ts_x, ts_y, alpha=0.6, c=z, s=2)#, label=f'{t:05d}')
+          plt.title(h_id)
+          # plt.legend(handles=handles)
+      
+        plt.figure("mse")
+        plt.tight_layout()
+        plt.savefig('vdm/mse_plot.png')
+        plt.figure("four")
+        plt.tight_layout()
+        plt.savefig('vdm/four_plot.png')
+        plt.figure("snr_four")
+        plt.tight_layout()
+        plt.savefig('vdm/snr_four_plot.png')
+
+    # Log evolution in fourier domain 
+    plot_evolve=True
+    if plot_evolve:
+      plt.clf()
+      plt.figure("evolve",figsize=(20,20))      
+      for ti, t in enumerate(T_list[:-1][::-1]):
+        fft_mag_list = []
+        for eval_step in range(self.config.training.num_steps_eval // 10):
+          seq_samples = self.p_sample_seq(params=params, T=flax_utils.replicate(jnp.ones([t,0])))
+          B, T, H, W, C = seq_samples.shape
+          # seq_samples = seq_samples.reshape(t, -1, H, W, C).transpose(1,0,2,3,4)
+          # B = B // t
+          seq_samples = (seq_samples.astype(float) / 127.5) - 1
+          fft_mag = jnp.linalg.norm(jnp.fft.fftshift(jnp.absolute(jnp.fft.fft2(seq_samples, axes=[2,3])), axes=[2,3])[:,:,:,16,:], axis=-1)
+          fft_mag_list.append(np.array(fft_mag))
+
+        fft_mag = np.vstack(fft_mag_list)
+        for h_id in range(16):
+          plt.subplot(4, 4, h_id+1)
+          y_seq = []
+          for tx in range(t):
+            x = np.ones(len(fft_mag)) * (tx + 1) / t
+            y = fft_mag[:,tx,16+h_id]
+            if len(y) > 1:
+              z = gaussian_kde(y)(y)
+              # z = z / z.max()
+            else:
+              z = np.ones(len(y))
+            plt.scatter(x,y, alpha=z, c=cm[ti], s=1, label=f"{t:05d}")
+            y_seq.append(y.mean())
+          y_seq = np.array(y_seq)
+          plt.plot((np.arange(t) + 1)/t, y_seq, c=cm[ti], label=f"{t:05d}")
+          plt.legend(handles=handles)
+          plt.title(h_id)
+
+        plt.tight_layout()
+        plt.savefig("vdm/evolve.png")
 
   def train_step(self, base_rng, state, batch):
     rng = jax.random.fold_in(base_rng, jax.lax.axis_index('batch'))
@@ -360,7 +568,14 @@ class Experiment(ABC):
         metrics['images'])
 
     return metrics
+  
+  def mse_step(self, base_rng, params, batch, eval_step=0):
+    rng = jax.random.fold_in(base_rng, jax.lax.axis_index('batch'))
+    rng = jax.random.fold_in(rng, eval_step)
 
+    logs = self.mse_fn(params, batch, rng=rng, is_train=False)
+
+    return logs
 
 def copy_dict(dict1, dict2):
   if not isinstance(dict1, dict):

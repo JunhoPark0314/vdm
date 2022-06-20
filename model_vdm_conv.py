@@ -25,6 +25,7 @@ import numpy as np
 @flax.struct.dataclass
 class VDMConfig:
   """VDM configurations."""
+  name: str
   vocab_size: int
   sample_softmax: bool
   antithetic_time_sampling: bool
@@ -62,7 +63,7 @@ def conv_gamma(gamma, f, square=False):
   # normalizer = np.sqrt(np.prod(gamma.shape[1:]))
   fft_ft = jnp.fft.rfft2(ft, axes=[1,2])
   if square:
-    fft_ft = jnp.square(fft_ft)
+    fft_ft = jnp.square(jnp.absolute(fft_ft))
   ft = jnp.fft.irfft2(fft_ft * jnp.repeat(gamma, G, axis=0).transpose(3,1,2,0), axes=[1, 2])
   # ft = jax.lax.conv_general_dilated(ft, jnp.repeat(gamma, G, axis=0), window_strides=(1,1), padding="SAME", 
   #   feature_group_count=N*D,dimension_numbers=("NHWC", "OIHW", "NHWC"))
@@ -98,12 +99,13 @@ class VDM(nn.Module):
       self.gamma = NoiseSchedule_FFT_NNet(self.config)
     else:
       raise Exception("Unknown self.var_model")
-  
-  def __call__(self, images, conditioning, deterministic: bool = True):
+
+  def __call__(self, images, conditioning, T_eval, deterministic: bool = True, use_t_eval: bool = False):
     g_0, g_1 = self.gamma(0.), self.gamma(1.)
     var_0, var_1 = nn.sigmoid(g_0), nn.sigmoid(g_1)
     x = images
     n_batch = images.shape[0]
+    t_eval = T_eval
 
     # encode
     f = self.encdec.encode(x)
@@ -119,7 +121,7 @@ class VDM(nn.Module):
     # 2. LATENT LOSS
     # KL z1 with N(0,1) prior
     # mean1_sqr = (1. - var_1) * jnp.square(f)
-    mean1_sqr = jnp.fft.rfft2(conv_gamma((1. - var_1), f), axes=[1,2])
+    mean1_sqr = jnp.fft.rfft2(conv_gamma((1. - var_1), f), axes=[1,2]) / f.shape[1]
     loss_klz = 0.5 * jnp.sum(jnp.square(mean1_sqr.real) + jnp.square(mean1_sqr.imag) + var_1 - jnp.log(var_1) - 1., axis=(1, 2, 3))
     # loss_klz = jnp.fft.ifft2(loss_klz, axes=[1,2])
 
@@ -136,6 +138,9 @@ class VDM(nn.Module):
     if self.config.sm_n_timesteps > 0:
       T = self.config.sm_n_timesteps
       t = jnp.ceil(t * T) / T
+    if use_t_eval:
+      T = t_eval
+      t = jnp.ceil(t * T) / T
 
     # sample z_t
     g_t = self.gamma(t)
@@ -148,17 +153,18 @@ class VDM(nn.Module):
     eps_hat = self.score_model(z_t, g_t, conditioning, deterministic)
     # compute MSE of predicted noise
     # loss_diff_mse = jnp.sum(jnp.square(eps - eps_hat), axis=[1, 2, 3])
-    loss_diff_mse = eps - eps_hat
+    loss_diff_mse = jnp.fft.rfft2(eps - eps_hat, axes=[1,2]) / f.shape[1]
+    loss_diff_mse = jnp.square(loss_diff_mse.real) + jnp.square(loss_diff_mse.imag)
 
-    if self.config.sm_n_timesteps == 0:
+    if (self.config.sm_n_timesteps == 0) and (use_t_eval == False):
       # loss for infinite depth T, i.e. continuous time
       _, g_t_grad = jax.jvp(self.gamma, (t,), (jnp.ones_like(t),))
-      loss_diff = .5 * conv_gamma(g_t_grad, loss_diff_mse, square=True)
+      loss_diff = .5 * g_t_grad * loss_diff_mse
     else:
       # loss for finite depth T, i.e. discrete time
       s = t - (1./T)
       g_s = self.gamma(s)
-      loss_diff = .5 * T * conv_gamma(jnp.expm1(g_t - g_s), loss_diff_mse, square=True)
+      loss_diff = .5 * T * jnp.expm1(g_t - g_s) * loss_diff_mse
 
     loss_diff = jnp.sum(loss_diff, axis=[1, 2, 3])
 
@@ -190,10 +196,12 @@ class VDM(nn.Module):
     b = nn.sigmoid(-g_t)
     c = - jnp.expm1(g_s - g_t)
     sigma_t = jnp.sqrt(nn.sigmoid(g_t))
+    alpha_st = jnp.sqrt(nn.sigmoid(-g_s) / nn.sigmoid(-g_t))
 
     # z_s = jnp.sqrt(nn.sigmoid(-g_s) / nn.sigmoid(-g_t)) * (z_t - sigma_t * c * eps_hat) + \
     #     jnp.sqrt((1. - a) * c) * eps
-    z_s = conv_gamma(jnp.sqrt(nn.sigmoid(-g_s) / nn.sigmoid(-g_t)), (z_t - conv_gamma(sigma_t * c , eps_hat))) + \
+    z_s = conv_gamma(alpha_st, z_t) + \
+        (- conv_gamma(alpha_st * sigma_t * c , eps_hat)) + \
         conv_gamma(jnp.sqrt((1. - a) * c) ,eps)
 
     return z_s

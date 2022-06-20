@@ -25,6 +25,7 @@ import numpy as np
 @flax.struct.dataclass
 class VDMConfig:
   """VDM configurations."""
+  name: str
   vocab_size: int
   sample_softmax: bool
   antithetic_time_sampling: bool
@@ -54,6 +55,18 @@ class VDMOutput:
   var_0: float
   var_1: float
 
+@flax.struct.dataclass
+class VDMLog:
+  loss_diff: chex.Array
+  timesteps: chex.Array
+  snr_deriv: chex.Array
+  snr_discrete: chex.Array
+  eps: chex.Array
+  eps_hat: chex.Array
+  f: chex.Array
+  alpha_t : chex.Array
+  sigma_t : chex.Array
+  loss_diff_snr : chex.Array
 
 class VDM(nn.Module):
   config: VDMConfig
@@ -70,11 +83,12 @@ class VDM(nn.Module):
     else:
       raise Exception("Unknown self.var_model")
 
-  def __call__(self, images, conditioning, deterministic: bool = True):
+  def __call__(self, images, conditioning, T_eval, deterministic: bool = True, use_t_eval: bool = False):
     g_0, g_1 = self.gamma(0.), self.gamma(1.)
     var_0, var_1 = nn.sigmoid(g_0), nn.sigmoid(g_1)
     x = images
     n_batch = images.shape[0]
+    t_eval = T_eval
 
     # encode
     f = self.encdec.encode(x)
@@ -104,6 +118,9 @@ class VDM(nn.Module):
     if self.config.sm_n_timesteps > 0:
       T = self.config.sm_n_timesteps
       t = jnp.ceil(t * T) / T
+    if use_t_eval:
+      T = t_eval
+      t = jnp.ceil(t * T) / T
 
     # sample z_t
     g_t = self.gamma(t)
@@ -115,7 +132,7 @@ class VDM(nn.Module):
     # compute MSE of predicted noise
     loss_diff_mse = jnp.sum(jnp.square(eps - eps_hat), axis=[1, 2, 3])
 
-    if self.config.sm_n_timesteps == 0:
+    if (self.config.sm_n_timesteps == 0) and (use_t_eval == False):
       # loss for infinite depth T, i.e. continuous time
       _, g_t_grad = jax.jvp(self.gamma, (t,), (jnp.ones_like(t),))
       loss_diff = .5 * g_t_grad * loss_diff_mse
@@ -135,12 +152,69 @@ class VDM(nn.Module):
         var_1=var_1,
     )
 
+  def calc_mse(self, images, conditioning, T_eval, deterministic: bool = True, use_t_eval: bool = False):
+    g_0, g_1 = self.gamma(0.), self.gamma(1.)
+    var_0, var_1 = nn.sigmoid(g_0), nn.sigmoid(g_1)
+    x = images
+    n_batch = images.shape[0]
+    t_eval = T_eval
+
+    # encode
+    f = self.encdec.encode(x)
+
+    # 3. DIFFUSION LOSS
+    # sample time steps
+    rng1 = self.make_rng("sample")
+    if self.config.antithetic_time_sampling:
+      t0 = jax.random.uniform(rng1)
+      t = jnp.mod(t0 + jnp.arange(0., 1., step=1. / n_batch), 1.)
+    else:
+      t = jax.random.uniform(rng1, shape=(n_batch,))
+
+    # discretize time steps if we're working with discrete time
+    if self.config.sm_n_timesteps > 0:
+      T = self.config.sm_n_timesteps
+      t = jnp.ceil(t * T) / T
+    if use_t_eval:
+      T = t_eval
+      t = jnp.ceil(t * T) / T
+
+    # sample z_t
+    g_t = self.gamma(t)
+    var_t = nn.sigmoid(g_t)[:, None, None, None]
+    eps = jax.random.normal(self.make_rng("sample"), shape=f.shape)
+    z_t = jnp.sqrt(1. - var_t) * f + jnp.sqrt(var_t) * eps
+    # compute predicted noise
+    eps_hat = self.score_model(z_t, g_t, conditioning, deterministic)
+    # compute MSE of predicted noise
+    loss_diff_mse = jnp.square(eps - eps_hat)
+    loss_diff_snr = jnp.square(eps - eps_hat) * (jnp.sqrt(var_t) / jnp.sqrt(1 - var_t))
+    _, g_t_grad = jax.jvp(self.gamma, (t,), (jnp.ones_like(t),))
+    s = t - (1./T)
+    g_s = self.gamma(s)
+
+    return VDMLog(
+        loss_diff=loss_diff_mse,
+        loss_diff_snr=loss_diff_snr,
+        timesteps=t,
+        snr_deriv=g_t_grad,
+        snr_discrete=jnp.expm1(g_t - g_s) * T,
+        eps=eps,
+        eps_hat=eps_hat,
+        f=f,
+        alpha_t=jnp.sqrt(1 - var_t),
+        sigma_t=jnp.sqrt(var_t)
+    )
+  
+
   def sample(self, i, T, z_t, conditioning, rng):
     rng_body = jax.random.fold_in(rng, i)
     eps = jax.random.normal(rng_body, z_t.shape)
 
-    t = (T - i) / T
-    s = (T - i - 1) / T
+    # t = ((T - i) / T) ** (0.05)
+    # s = ((T - i - 1) / T) ** (0.05)
+    t = ((T - i) / T) 
+    s = ((T - i - 1) / T) 
 
     g_s, g_t = self.gamma(s), self.gamma(t)
     eps_hat = self.score_model(
@@ -155,6 +229,7 @@ class VDM(nn.Module):
 
     z_s = jnp.sqrt(nn.sigmoid(-g_s) / nn.sigmoid(-g_t)) * (z_t - sigma_t * c * eps_hat) + \
         jnp.sqrt((1. - a) * c) * eps
+    # z_s = jnp.sqrt(nn.sigmoid(-g_s) / nn.sigmoid(-g_t)) * (z_t - sigma_t * eps_hat) + jnp.sqrt(nn.sigmoid(g_s)) * eps
 
     return z_s
 
