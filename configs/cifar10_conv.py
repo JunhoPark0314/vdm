@@ -34,6 +34,7 @@ def get_config():
   )
 
   config.model = d(
+      name="conv",
       vocab_size=256,
       sample_softmax=False,
       antithetic_time_sampling=True,
@@ -48,7 +49,7 @@ def get_config():
       gamma_shape=(32, 17),
 
       # configurations of the score model
-      sm_n_timesteps=10,
+      sm_n_timesteps=0,
       sm_n_embd=128,
       sm_n_layer=32,
       sm_pdrop=0.1,
@@ -60,12 +61,12 @@ def get_config():
       num_steps_lr_warmup=100,
       num_steps_train=10_000_000,
       num_steps_eval=100,
-      batch_size_train=128,
+      batch_size_train=256,
       batch_size_eval=128,
       steps_per_logging=1000,
-      steps_per_eval=1000,
-      steps_per_img=1000,
-      steps_per_save=10_000,
+      steps_per_eval=2000,
+      steps_per_save=1000,
+      steps_per_img=10_000,
       profile=False,
   )
 

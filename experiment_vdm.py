@@ -17,6 +17,7 @@ import jax.numpy as jnp
 from jax._src.random import PRNGKey
 import jax
 from typing import Any, Tuple
+import functools
 
 from vdm.experiment import Experiment
 import vdm.model_vdm_conv as model_vdm_conv
@@ -77,38 +78,108 @@ class Experiment_VDM(Experiment):
 
     return bpd, metrics
 
-  def sample_fn(self, *, dummy_inputs, rng, params, T):
-    rng = jax.random.fold_in(rng, jax.lax.axis_index('batch'))
+  def mse_fn(self, params, inputs, rng, is_train) -> Tuple[float, Any]:
+    rng, sample_rng = jax.random.split(rng)
+    rngs = {"sample": sample_rng}
+    if is_train:
+      rng, dropout_rng = jax.random.split(rng)
+      rngs["dropout"] = dropout_rng
 
+    # sample time steps, with antithetic sampling
+    outputs = self.state.apply_fn(
+        variables={'params': params},
+        **inputs,
+        rngs=rngs,
+        deterministic=not is_train,
+        use_t_eval=not is_train, 
+        method=self.model.calc_mse
+    )
+
+    rescale_to_bpd = 1./(np.log(2.))
+    # bpd_latent = outputs.loss_klz * rescale_to_bpd
+    # bpd_recon = outputs.loss_recon * rescale_to_bpd
+    # bpd_diff = outputs.loss_diff * rescale_to_bpd
+    # bpd = bpd_recon + bpd_latent + bpd_diff
+    scalar_dict = {
+        # "bpd": bpd,
+        # "bpd_latent": bpd_latent,
+        # "bpd_recon": bpd_recon,
+        "timesteps": outputs.timesteps,
+        "snr_deriv": outputs.snr_deriv,
+        "snr_discrete": outputs.snr_discrete,
+        "loss_diff": outputs.loss_diff,
+        "loss_diff_snr": outputs.loss_diff_snr,
+        "f": outputs.f,
+        "eps": outputs.eps,
+        "eps_hat": outputs.eps_hat,
+        "alpha_t": outputs.alpha_t,
+        "sigma_t" : outputs.sigma_t,
+        # "var0": outputs.var_0,
+        # "var": outputs.var_1,
+    }
+    # img_dict = {"inputs": inputs["images"]}
+    # metrics = {"scalars": scalar_dict, "images": img_dict}
+
+    return scalar_dict
+
+  # @functools.partial(jax.jit, static_argnames=['T'])
+  def sample_fn(self, *, dummy_inputs, rng, params, T, return_seq=False):
+    rng = jax.random.fold_in(rng, jax.lax.axis_index('batch'))
+    B, H, W, C = dummy_inputs.shape
+    T_ = T.shape[0]
+    if return_seq:
+      t_eval = T_
+    else:
+      t_eval = 1
     # if self.model.config.sm_n_timesteps > 0:
     #   T = self.model.config.sm_n_timesteps
     # else:
     #   T = 1000
 
     conditioning = jnp.zeros((dummy_inputs.shape[0],), dtype='uint8')
-
     # sample z_0 from the diffusion model
     rng, sample_rng = jax.random.split(rng)
-    z_init = jax.random.normal(sample_rng, dummy_inputs.shape)
+    z_init = jax.random.normal(sample_rng, (t_eval, B, H, W, C))
 
-    def body_fn(i, z_t):
-      return self.state.apply_fn(
+    def seq_body_fn(i, state):
+      z_s = self.state.apply_fn(
           variables={'params': params},
           i=i,
-          T=T,
+          T=T_,
+          z_t=state[i],
+          conditioning=conditioning,
+          rng=rng,
+          method=self.model.sample,
+      )
+      state = state.at[i+1].set(z_s)
+      return state
+
+    def single_body_fn(i, state):
+      z_t = state
+      z_s = self.state.apply_fn(
+          variables={'params': params},
+          i=i,
+          T=T_,
           z_t=z_t,
           conditioning=conditioning,
           rng=rng,
           method=self.model.sample,
       )
+      return z_s
+
+    if return_seq:
+      body_fn = seq_body_fn
+    else:
+      body_fn = single_body_fn
 
     z_0 = jax.lax.fori_loop(
-        lower=0, upper=T, body_fun=body_fn, init_val=z_init)
-
+        lower=0, upper=T_, body_fun=body_fn, init_val=z_init)
+    z_0 = jnp.reshape(z_0, (-1, H, W, C))
+    
     samples = self.state.apply_fn(
         variables={'params': params},
         z_0=z_0,
         method=self.model.generate_x,
     )
 
-    return samples
+    return samples.reshape(t_eval, B, H, W, C).transpose(1, 0, 2, 3, 4)

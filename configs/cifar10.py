@@ -34,6 +34,7 @@ def get_config():
   )
 
   config.model = d(
+      name="base",
       vocab_size=256,
       sample_softmax=False,
       antithetic_time_sampling=True,
