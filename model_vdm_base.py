@@ -26,6 +26,7 @@ import numpy as np
 class VDMConfig:
   """VDM configurations."""
   name: str
+  stats: str
   vocab_size: int
   sample_softmax: bool
   antithetic_time_sampling: bool
@@ -58,18 +59,22 @@ class VDMOutput:
 @flax.struct.dataclass
 class VDMLog:
   loss_diff: chex.Array
+  loss_diff_snr : chex.Array
   timesteps: chex.Array
-  snr_deriv: chex.Array
+  g_t_grad: chex.Array
+  exp_g_t: chex.Array
   snr_discrete: chex.Array
   eps: chex.Array
   eps_hat: chex.Array
   f: chex.Array
   alpha_t : chex.Array
   sigma_t : chex.Array
-  loss_diff_snr : chex.Array
 
 class VDM(nn.Module):
   config: VDMConfig
+  z_mean: chex.Array = None
+  z_std: chex.Array = None
+  eps_map: chex.Array = None
 
   def setup(self):
     self.encdec = EncDec(self.config)
@@ -83,6 +88,23 @@ class VDM(nn.Module):
     else:
       raise Exception("Unknown self.var_model")
 
+  def sample_eps(self, rng, shape, axes=[1,2]):
+    if True:
+      # uniform_noise = jax.random.uniform(rng, minval=-jnp.pi, maxval=jnp.pi, shape=shape)
+      # normal_noise = jax.random.normal(rng, shape=shape)
+      # fft_eps = jax.lax.complex(jax.lax.sin(uniform_noise), jax.lax.cos(uniform_noise)) * (self.z_mean + self.z_std * normal_noise)
+      # eps = jnp.fft.irfft2(fft_eps, axes=axes)
+      # eps = self.eps_map.min() / self.eps_map * eps
+      real_noise = jax.random.normal(rng, shape=shape)
+      imag_noise = jax.random.normal(rng, shape=shape)
+      fft_eps = jax.lax.complex(real_noise, imag_noise) * jnp.sqrt(self.z_std) + self.z_mean
+      eps = jnp.fft.irfft2(fft_eps, axes=axes)
+      # eps = self.eps_map.min() / self.eps_map * eps
+    else:
+      eps = jax.random.normal(rng, shape=(*shape[:-2], 32, *shape[-1:]))
+
+    return eps
+
   def __call__(self, images, conditioning, T_eval, deterministic: bool = True, use_t_eval: bool = False):
     g_0, g_1 = self.gamma(0.), self.gamma(1.)
     var_0, var_1 = nn.sigmoid(g_0), nn.sigmoid(g_1)
@@ -95,7 +117,8 @@ class VDM(nn.Module):
 
     # 1. RECONSTRUCTION LOSS
     # add noise and reconstruct
-    eps_0 = jax.random.normal(self.make_rng("sample"), shape=f.shape)
+    # eps_0 = jax.random.normal(self.make_rng("sample"), shape=f.shape)
+    eps_0 = self.sample_eps(self.make_rng("sample"), (f.shape[0], 32, 17,f.shape[-1]))
     z_0 = jnp.sqrt(1. - var_0) * f + jnp.sqrt(var_0) * eps_0
     z_0_rescaled = f + jnp.exp(0.5 * g_0) * eps_0  # = z_0/sqrt(1-var)
     loss_recon = - self.encdec.logprob(x, z_0_rescaled, g_0)
@@ -125,7 +148,8 @@ class VDM(nn.Module):
     # sample z_t
     g_t = self.gamma(t)
     var_t = nn.sigmoid(g_t)[:, None, None, None]
-    eps = jax.random.normal(self.make_rng("sample"), shape=f.shape)
+    # eps = jax.random.normal(self.make_rng("sample"), shape=f.shape)
+    eps = self.sample_eps(self.make_rng("sample"), (f.shape[0], 32, 17,f.shape[-1]))
     z_t = jnp.sqrt(1. - var_t) * f + jnp.sqrt(var_t) * eps
     # compute predicted noise
     eps_hat = self.score_model(z_t, g_t, conditioning, deterministic)
@@ -182,7 +206,9 @@ class VDM(nn.Module):
     # sample z_t
     g_t = self.gamma(t)
     var_t = nn.sigmoid(g_t)[:, None, None, None]
-    eps = jax.random.normal(self.make_rng("sample"), shape=f.shape)
+    # eps = jax.random.normal(self.make_rng("sample"), shape=f.shape)
+    eps = self.sample_eps(self.make_rng("sample"), (f.shape[0],32, 17,f.shape[-1]))
+
     z_t = jnp.sqrt(1. - var_t) * f + jnp.sqrt(var_t) * eps
     # compute predicted noise
     eps_hat = self.score_model(z_t, g_t, conditioning, deterministic)
@@ -197,8 +223,9 @@ class VDM(nn.Module):
         loss_diff=loss_diff_mse,
         loss_diff_snr=loss_diff_snr,
         timesteps=t,
-        snr_deriv=g_t_grad,
-        snr_discrete=jnp.expm1(g_t - g_s) * T,
+        g_t_grad=g_t_grad,
+        exp_g_t=jnp.expm1(g_t),
+        snr_discrete=jnp.expm1(g_t - g_s),
         eps=eps,
         eps_hat=eps_hat,
         f=f,
@@ -206,15 +233,13 @@ class VDM(nn.Module):
         sigma_t=jnp.sqrt(var_t)
     )
   
-
   def sample(self, i, T, z_t, conditioning, rng):
     rng_body = jax.random.fold_in(rng, i)
-    eps = jax.random.normal(rng_body, z_t.shape)
+    # eps = jax.random.normal(rng_body, z_t.shape)
+    eps = self.sample_eps(rng_body, (z_t.shape[0],32, 17,z_t.shape[-1]))
 
-    # t = ((T - i) / T) ** (0.05)
-    # s = ((T - i - 1) / T) ** (0.05)
-    t = ((T - i) / T) 
-    s = ((T - i - 1) / T) 
+    t = (T - i) / T
+    s = (T - i - 1) / T
 
     g_s, g_t = self.gamma(s), self.gamma(t)
     eps_hat = self.score_model(

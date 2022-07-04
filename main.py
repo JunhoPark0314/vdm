@@ -16,6 +16,7 @@ import os  # nopep8
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = "2"  # Disable TF info/warnings # nopep8
 
 import jax
+import jax.numpy as jnp
 import tensorflow as tf
 from absl import logging
 from absl import flags
@@ -28,10 +29,11 @@ FLAGS = flags.FLAGS
 config_flags.DEFINE_config_file(
     "config", None, "Training configuration.", lock_config=False)
 flags.DEFINE_string("workdir", None, "Work unit directory.")
+flags.DEFINE_string("stats", None, "stat path.")
 flags.DEFINE_string("mode", 'train', "train / eval")
 flags.DEFINE_string("model", 'vdm', 'vdm')
 flags.mark_flags_as_required(["config", "workdir"])
-flags.DEFINE_string("log_level", "info", "info/warning/error")
+flags.DEFINE_string("log_level", "info", "info/warning/error/debug")
 
 
 def main(argv):
@@ -49,6 +51,9 @@ def main(argv):
   logging.info("JAX process: %d / %d",
                jax.process_index(), jax.process_count())
   logging.info("JAX devices: %r", jax.devices())
+
+  if FLAGS.stats:
+    FLAGS.config.model.stats = FLAGS.stats
 
   if FLAGS.model == "vdm":
     experiment = vdm.experiment_vdm.Experiment_VDM(FLAGS.config)

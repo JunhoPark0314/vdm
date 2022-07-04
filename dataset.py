@@ -25,7 +25,7 @@ AUTOTUNE = tf.data.experimental.AUTOTUNE
 
 def create_dataset(config, data_rng):
     data_rng = jax.random.fold_in(data_rng, jax.process_index())
-    rng1, rng2 = jax.random.split(data_rng)
+    rng1, rng2, rng3 = jax.random.split(data_rng, 3)
     if config.data.dataset == 'cifar10':
       _, train_ds = create_train_dataset(
           'cifar10',
@@ -39,6 +39,13 @@ def create_dataset(config, data_rng):
           config.training.batch_size_eval,
           'test',
           rng2,
+          _preprocess_cifar10)
+      
+      _, phase_ds = create_train_dataset(
+        'cifar10',
+          config.training.batch_size_train,
+          config.training.substeps,
+          rng3,
           _preprocess_cifar10)
 
     elif config.data.dataset == 'cifar10_aug':
@@ -88,7 +95,7 @@ def create_dataset(config, data_rng):
     else:
       raise Exception("Unrecognized config.data.dataset")
 
-    return iter(train_ds), iter(eval_ds)
+    return iter(train_ds), iter(eval_ds), iter(phase_ds)
 
 def create_train_dataset(
         task: str,

@@ -34,8 +34,15 @@ class Experiment_VDM(Experiment):
     elif config.model.name == "conv":
       model_vdm = model_vdm_conv
 
+    if hasattr(self.config.model, 'stats') and self.config.model.stats:
+      stats = jnp.load(self.config.model.stats)
+      z_mean = stats['mean']
+      z_std = stats['std']
+      # eps_map = stats['refine']
+      eps_map = None
+
     config = model_vdm.VDMConfig(**config.model)
-    model = model_vdm.VDM(config)
+    model = model_vdm.VDM(config, z_mean, z_std, eps_map)
 
     inputs = {"images": jnp.zeros((2, 32, 32, 3), "uint8")}
     inputs["conditioning"] = jnp.zeros((2,))
@@ -100,23 +107,9 @@ class Experiment_VDM(Experiment):
     # bpd_recon = outputs.loss_recon * rescale_to_bpd
     # bpd_diff = outputs.loss_diff * rescale_to_bpd
     # bpd = bpd_recon + bpd_latent + bpd_diff
-    scalar_dict = {
-        # "bpd": bpd,
-        # "bpd_latent": bpd_latent,
-        # "bpd_recon": bpd_recon,
-        "timesteps": outputs.timesteps,
-        "snr_deriv": outputs.snr_deriv,
-        "snr_discrete": outputs.snr_discrete,
-        "loss_diff": outputs.loss_diff,
-        "loss_diff_snr": outputs.loss_diff_snr,
-        "f": outputs.f,
-        "eps": outputs.eps,
-        "eps_hat": outputs.eps_hat,
-        "alpha_t": outputs.alpha_t,
-        "sigma_t" : outputs.sigma_t,
-        # "var0": outputs.var_0,
-        # "var": outputs.var_1,
-    }
+    scalar_dict = {}
+    for k in outputs.__annotations__.keys():
+      scalar_dict[k] = getattr(outputs, k)
     # img_dict = {"inputs": inputs["images"]}
     # metrics = {"scalars": scalar_dict, "images": img_dict}
 
@@ -139,7 +132,10 @@ class Experiment_VDM(Experiment):
     conditioning = jnp.zeros((dummy_inputs.shape[0],), dtype='uint8')
     # sample z_0 from the diffusion model
     rng, sample_rng = jax.random.split(rng)
-    z_init = jax.random.normal(sample_rng, (t_eval, B, H, W, C))
+    if hasattr(self.model, 'sample_eps'):
+      z_init = self.model.sample_eps(sample_rng, (t_eval, B, 32, 17, C), axes=[2,3])
+    else:
+      z_init = jax.random.normal(sample_rng, (t_eval, B, H, W, C))
 
     def seq_body_fn(i, state):
       z_s = self.state.apply_fn(
@@ -160,12 +156,12 @@ class Experiment_VDM(Experiment):
           variables={'params': params},
           i=i,
           T=T_,
-          z_t=z_t,
+          z_t=z_t[0],
           conditioning=conditioning,
           rng=rng,
           method=self.model.sample,
       )
-      return z_s
+      return z_s[None,:]
 
     if return_seq:
       body_fn = seq_body_fn
