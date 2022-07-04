@@ -495,9 +495,9 @@ class Experiment(ABC):
     if plot_evolve:
       plt.clf()
       plt.figure("evolve",figsize=(20,20))      
-      for ti, t in enumerate(T_list[:-1][::-1]):
+      for ti, t in enumerate(T_list[:-1]):
         fft_mag_list = []
-        for eval_step in range(self.config.training.num_steps_eval // 10):
+        for eval_step in range(self.config.training.num_steps_eval // 50):
           seq_samples = self.p_sample_seq(params=params, T=flax_utils.replicate(jnp.ones([t,0])))
           B, T, H, W, C = seq_samples.shape
           # seq_samples = seq_samples.reshape(t, -1, H, W, C).transpose(1,0,2,3,4)
@@ -518,11 +518,11 @@ class Experiment(ABC):
               # z = z / z.max()
             else:
               z = np.ones(len(y))
-            plt.scatter(x,y, alpha=z, c=cm[ti], s=1, label=f"{t:05d}")
+            plt.scatter(x,y, alpha=z / 3, c=cm[ti], s=0.2, label=f"{t:05d}")
             y_seq.append(y.mean())
           y_seq = np.array(y_seq)
           plt.plot((np.arange(t) + 1)/t, y_seq, c=cm[ti], label=f"{t:05d}")
-          plt.legend(handles=handles)
+          plt.legend(handles=handles, loc='upper left')
           plt.title(h_id)
 
         plt.tight_layout()
