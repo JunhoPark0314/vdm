@@ -36,13 +36,10 @@ class Experiment_VDM(Experiment):
 
     if hasattr(self.config.model, 'stats') and self.config.model.stats:
       stats = jnp.load(self.config.model.stats)
-      z_mean = stats['mean']
       z_std = stats['std']
-      # eps_map = stats['refine']
-      eps_map = None
 
     config = model_vdm.VDMConfig(**config.model)
-    model = model_vdm.VDM(config, z_mean, z_std, eps_map)
+    model = model_vdm.VDM(config, z_std)
 
     inputs = {"images": jnp.zeros((2, 32, 32, 3), "uint8")}
     inputs["conditioning"] = jnp.zeros((2,))
@@ -68,6 +65,7 @@ class Experiment_VDM(Experiment):
     )
 
     rescale_to_bpd = 1./(np.prod(inputs["images"].shape[1:]) * np.log(2.))
+    # rescale_to_bpd = 1./(32 * 17 * 3 * np.log(2.))
     bpd_latent = jnp.mean(outputs.loss_klz) * rescale_to_bpd
     bpd_recon = jnp.mean(outputs.loss_recon) * rescale_to_bpd
     bpd_diff = jnp.mean(outputs.loss_diff) * rescale_to_bpd
@@ -115,11 +113,11 @@ class Experiment_VDM(Experiment):
 
     return scalar_dict
 
-  # @functools.partial(jax.jit, static_argnames=['T'])
-  def sample_fn(self, *, dummy_inputs, rng, params, T, return_seq=False):
+  def sample_intermediate_fn(self, *, dummy_inputs, rng, params, T, return_seq=False):
     rng = jax.random.fold_in(rng, jax.lax.axis_index('batch'))
     B, H, W, C = dummy_inputs.shape
     T_ = T.shape[0]
+    B = min(int(1000 / T_), B)
     if return_seq:
       t_eval = T_
     else:
@@ -129,53 +127,141 @@ class Experiment_VDM(Experiment):
     # else:
     #   T = 1000
 
-    conditioning = jnp.zeros((dummy_inputs.shape[0],), dtype='uint8')
+    conditioning = jnp.zeros((B,), dtype='uint8')
     # sample z_0 from the diffusion model
     rng, sample_rng = jax.random.split(rng)
     if hasattr(self.model, 'sample_eps'):
       z_init = self.model.sample_eps(sample_rng, (t_eval, B, 32, 17, C), axes=[2,3])
     else:
       z_init = jax.random.normal(sample_rng, (t_eval, B, H, W, C))
+    
+    state = {
+      "z_s": z_init,
+      "z_t_coeff": jax.random.normal(sample_rng, (t_eval, B, H, W, C)),
+      "eps_hat": jax.random.normal(sample_rng, (t_eval, B, H, W, C)),
+      "eps": jax.random.normal(sample_rng, (t_eval, B, H, W, C)),
+    }
 
     def seq_body_fn(i, state):
-      z_s = self.state.apply_fn(
+      z_s, z_t_coeff, eps_hat, eps = self.state.apply_fn(
           variables={'params': params},
           i=i,
           T=T_,
-          z_t=state[i],
+          z_t=state["z_s"][i],
           conditioning=conditioning,
           rng=rng,
           method=self.model.sample,
       )
-      state = state.at[i+1].set(z_s)
+      state["z_s"] = state["z_s"].at[i+1].set(z_s)
+      state["z_t_coeff"] = state["z_t_coeff"].at[i+1].set(z_t_coeff)
+      state["eps_hat"] = state["eps_hat"].at[i+1].set(eps_hat)
+      state["eps"] = state["eps"].at[i+1].set(eps)
+      
       return state
 
     def single_body_fn(i, state):
-      z_t = state
-      z_s = self.state.apply_fn(
+      z_s, z_t_coeff, eps_hat, eps = self.state.apply_fn(
           variables={'params': params},
           i=i,
           T=T_,
-          z_t=z_t[0],
+          z_t=state["z_s"][0],
           conditioning=conditioning,
           rng=rng,
           method=self.model.sample,
       )
-      return z_s[None,:]
+      state["z_s"] = state["z_s"].at[0].set(z_s)
+      return state
 
     if return_seq:
       body_fn = seq_body_fn
     else:
       body_fn = single_body_fn
 
-    z_0 = jax.lax.fori_loop(
-        lower=0, upper=T_, body_fun=body_fn, init_val=z_init)
-    z_0 = jnp.reshape(z_0, (-1, H, W, C))
+    state = jax.lax.fori_loop(
+        lower=0, upper=T_, body_fun=body_fn, init_val=state)
     
-    samples = self.state.apply_fn(
-        variables={'params': params},
-        z_0=z_0,
-        method=self.model.generate_x,
-    )
+    for k, v in state.items():
+      v = jnp.reshape(v, (-1, H, W, C))
+      samples = self.state.apply_fn(
+          variables={'params': params},
+          z_0=v,
+          method=self.model.generate_x,
+      )
+      state[k] = samples.reshape(t_eval, B, H, W, C).transpose(1, 0, 2, 3, 4)
 
-    return samples.reshape(t_eval, B, H, W, C).transpose(1, 0, 2, 3, 4)
+    return state
+
+  # @functools.partial(jax.jit, static_argnames=['T'])
+  def sample_fn(self, *, dummy_inputs, rng, params, T, return_seq=False):
+    rng = jax.random.fold_in(rng, jax.lax.axis_index('batch'))
+    B, H, W, C = dummy_inputs.shape
+    T_ = T.shape[0]
+    # B = min(int(1000 / T), B)
+    B = min(int(1000 / T_), B)
+    if return_seq:
+      t_eval = T_
+    else:
+      t_eval = 1
+    # if self.model.config.sm_n_timesteps > 0:
+    #   T = self.model.config.sm_n_timesteps
+    # else:
+    #   T = 1000
+
+    conditioning = jnp.zeros((B,), dtype='uint8')
+    # sample z_0 from the diffusion model
+    rng, sample_rng = jax.random.split(rng)
+    if hasattr(self.model, 'sample_eps'):
+      z_init = self.model.sample_eps(sample_rng, (t_eval, B, 32, 17, C), axes=[2,3]) #+ jnp.fft.irfft2(self.model.z_mean, axes=[1,2])[None,:]
+    else:
+      z_init = jax.random.normal(sample_rng, (t_eval, B, H, W, C))
+    
+    state = {
+      "z_s": z_init,
+    }
+
+    def seq_body_fn(i, state):
+      z_s = self.state.apply_fn(
+          variables={'params': params},
+          i=i,
+          T=T_,
+          z_t=state["z_s"][i],
+          conditioning=conditioning,
+          rng=rng,
+          method=self.model.sample,
+      )
+      state["z_s"] = state["z_s"].at[i+1].set(z_s)
+      
+      return state
+
+    def single_body_fn(i, state):
+      z_s = self.state.apply_fn(
+          variables={'params': params},
+          i=i,
+          T=T_,
+          z_t=state["z_s"][0],
+          conditioning=conditioning,
+          rng=rng,
+          method=self.model.sample,
+      )
+      state["z_s"] = state["z_s"].at[0].set(z_s)
+      return state
+
+    if return_seq:
+      body_fn = seq_body_fn
+    else:
+      body_fn = single_body_fn
+
+    state = jax.lax.fori_loop(
+        lower=0, upper=T_, body_fun=body_fn, init_val=state)
+    
+    for k, v in state.items():
+      v = jnp.reshape(v, (-1, H, W, C))
+      samples = self.state.apply_fn(
+          variables={'params': params},
+          z_0=v,
+          method=self.model.generate_x,
+      )
+      state[k] = samples.reshape(t_eval, B, H, W, C).transpose(1, 0, 2, 3, 4)
+
+    return state
+

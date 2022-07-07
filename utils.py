@@ -33,6 +33,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from pprint import pformat
+from PIL import Image
 
 
 def get_workdir(base):
@@ -167,7 +168,7 @@ def create_custom_writer(logdir: str, process_index: int,
       return AsyncWriter(CustomLoggingWriter())
     else:
       return CustomLoggingWriter()
-  writers = [CustomLoggingWriter(), SummaryWriter(logdir)]
+  writers = [CustomLoggingWriter(), CustomDiskWriter(logdir), SummaryWriter(logdir)]
   if asynchronous:
     return AsyncMultiWriter(writers)
   return MultiWriter(writers)
@@ -195,6 +196,29 @@ class CustomLoggingWriter(LoggingWriter):
     logging.info("[%d] Got images: %s.", step,
                  {k: v.shape for k, v in images.items()})
 
+class CustomDiskWriter(LoggingWriter):
+  def __init__(self, logdir: str):
+    super().__init__()
+    self.logdir = logdir
+
+  def write_scalars(self, step: int, scalars: Mapping[str, metric_writers.interface.Scalar]):
+    pass
+
+  def write_texts(self, step: int, texts: Mapping[str, str]):
+    pass
+
+  def write_hparams(self, hparams: Mapping[str, Any]):
+    pass
+
+  def write_images(self, step: int, images: Mapping[str, Any]):
+    for key, value in images.items():
+      img = value
+      if len(value.shape) == 4:
+        img = value[0]
+      dir_path = os.path.join(self.logdir, key)
+      file_name = f'step_{step:05d}.png'
+      os.makedirs(dir_path, exist_ok=True)
+      Image.fromarray(np.array(img).astype(np.uint8)).save(os.path.join(dir_path, file_name))
 
 """ Run with temporary verbosity """
 

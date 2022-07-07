@@ -97,14 +97,14 @@ class VDMLog:
   eps: chex.Array
   eps_hat: chex.Array
   f: chex.Array
+  z_t: chex.Array
   alpha_t : chex.Array
   sigma_t : chex.Array
+  recon : chex.Array
 
 class VDM(nn.Module):
   config: VDMConfig
-  z_mean: chex.Array = None
   z_std: chex.Array = None
-  eps_map: chex.Array = None
 
   def setup(self):
     self.encdec = EncDec(self.config)
@@ -125,7 +125,7 @@ class VDM(nn.Module):
     if True:
       real_noise = jax.random.normal(rng, shape=shape)
       imag_noise = jax.random.normal(rng, shape=shape)
-      fft_eps = jax.lax.complex(real_noise, imag_noise) * jnp.sqrt(self.z_std) + self.z_mean
+      fft_eps = jax.lax.complex(real_noise, imag_noise) * jnp.sqrt(self.z_std * 0.5) #+ self.z_mean
       eps = jnp.fft.irfft2(fft_eps, axes=axes)
     else:
       eps = jax.random.normal(rng, shape=(*shape[:-2], 32, *shape[-1:]))
@@ -135,6 +135,7 @@ class VDM(nn.Module):
   def __call__(self, images, conditioning, T_eval, deterministic: bool = True, use_t_eval: bool = False):
     g_0, g_1 = self.gamma(0.), self.gamma(1.)
     var_0, var_1 = nn.sigmoid(g_0), nn.sigmoid(g_1)
+    mu_0, mu_1 = (1 - jnp.sqrt(1. - var_0)), (1 - jnp.sqrt(1. - var_1))
     x = images
     n_batch = images.shape[0]
     t_eval = T_eval
@@ -152,16 +153,16 @@ class VDM(nn.Module):
 
     # z_0 = jnp.sqrt(1. - var_0) * f + jnp.sqrt(var_0) * eps_0
     # z_0_rescaled = f + jnp.exp(0.5 * g_0) * eps_0 # = z_0/sqrt(1-var)
-    z_0_rescaled = f + conv_gamma(jnp.exp(0.5 * g_0), eps_0) # = z_0/sqrt(1-var)
+    z_0_rescaled = f + conv_gamma(jnp.exp(0.5 * g_0), eps_0) #+ jnp.fft.irfft2(mu_0 * self.z_mean, axes=[1,2]) # = z_0/sqrt(1-var)
     loss_recon = - self.encdec.logprob(x, z_0_rescaled, g_0)
 
     # 2. LATENT LOSS
     # KL z1 with N(0,1) prior
     # mean1_sqr = (1. - var_1) * jnp.square(f)
 
-    mean1_sqr = jnp.fft.rfft2(conv_gamma((1. - var_1), f), axes=[1,2])
+    mean1_sqr = jnp.fft.rfft2(conv_gamma(jnp.sqrt(1. - var_1), f), axes=[1,2]) #+ (mu_1 - 1) * self.z_mean
     mean_diff = (jnp.square(mean1_sqr.real) + jnp.square(mean1_sqr.imag))
-    loss_klz = 0.5 * jnp.sum(mean_diff / self.z_std + var_1 - jnp.log(var_1) - 1, axis=(1, 2, 3))
+    loss_klz = 0.5 * jnp.sum(mean_diff / (self.z_std) + var_1 - jnp.log(var_1) - 1, axis=(1, 2, 3))
 
     # loss_klz = jnp.fft.ifft2(loss_klz, axes=[1,2])
 
@@ -186,16 +187,18 @@ class VDM(nn.Module):
     g_t = self.gamma(t)
     # var_t = nn.sigmoid(g_t)[:, None, None, None]
     var_t = nn.sigmoid(g_t)#[:, None, None, None]
+    mu_t = (1 - jnp.sqrt(1. - var_t))
     # eps = jax.random.normal(self.make_rng("sample"), shape=f.shape)
     eps = self.sample_eps(self.make_rng("sample"), (f.shape[0],*self.config.gamma_shape,f.shape[-1]))
     # z_t = jnp.sqrt(1. - var_t) * f + jnp.sqrt(var_t) * eps
-    z_t = conv_gamma(jnp.sqrt(1. - var_t), f) + conv_gamma(jnp.sqrt(var_t), eps)
+    z_t = conv_gamma(jnp.sqrt(1. - var_t), f) + conv_gamma(jnp.sqrt(var_t), eps) #+ jnp.fft.irfft2(mu_t * self.z_mean, axes=[1,2])
     # compute predicted noise
     eps_hat = self.score_model(z_t, g_t, conditioning, deterministic)
     # compute MSE of predicted noise
     # loss_diff_mse = jnp.sum(jnp.square(eps - eps_hat), axis=[1, 2, 3])
     loss_diff_mse = jnp.fft.rfft2(eps - eps_hat, axes=[1,2])
-    loss_diff_mse = (jnp.square(loss_diff_mse.real) + jnp.square(loss_diff_mse.imag)) / jnp.square(self.z_std)
+    loss_diff_mse = (jnp.square(loss_diff_mse.real) + jnp.square(loss_diff_mse.imag)) / self.z_std
+
 
     if (self.config.sm_n_timesteps == 0) and (use_t_eval == False):
       # loss for infinite depth T, i.e. continuous time
@@ -222,6 +225,7 @@ class VDM(nn.Module):
   def calc_mse(self, images, conditioning, T_eval, deterministic: bool = True, use_t_eval: bool = False):
     g_0, g_1 = self.gamma(0.), self.gamma(1.)
     var_0, var_1 = nn.sigmoid(g_0), nn.sigmoid(g_1)
+    mu_0, mu_1 = (1 - jnp.sqrt(1. - var_0)), (1 - jnp.sqrt(1. - var_1))
     x = images
     n_batch = images.shape[0]
     t_eval = T_eval
@@ -248,17 +252,25 @@ class VDM(nn.Module):
 
     # sample z_t
     g_t = self.gamma(t)
-    var_t = nn.sigmoid(g_t)[:, None, None, None]
-    eps = jax.random.normal(self.make_rng("sample"), shape=f.shape)
-    z_t = jnp.sqrt(1. - var_t) * f + jnp.sqrt(var_t) * eps
+    # var_t = nn.sigmoid(g_t)[:, None, None, None]
+    var_t = nn.sigmoid(g_t)#[:, None, None, None]
+    mu_t = (1 - jnp.sqrt(1. - var_t))
+    # eps = jax.random.normal(self.make_rng("sample"), shape=f.shape)
+    eps = self.sample_eps(self.make_rng("sample"), (f.shape[0],*self.config.gamma_shape,f.shape[-1]))
+    # z_t = jnp.sqrt(1. - var_t) * f + jnp.sqrt(var_t) * eps
+    z_t = conv_gamma(jnp.sqrt(1. - var_t), f) + conv_gamma(jnp.sqrt(var_t), eps) #+ jnp.fft.irfft2(mu_t * self.z_mean, axes=[1,2])
     # compute predicted noise
     eps_hat = self.score_model(z_t, g_t, conditioning, deterministic)
     # compute MSE of predicted noise
-    loss_diff_mse = jnp.square(eps - eps_hat)
-    loss_diff_snr = jnp.square(eps - eps_hat) * (jnp.sqrt(var_t) / jnp.sqrt(1 - var_t))
+    # loss_diff_mse = jnp.sum(jnp.square(eps - eps_hat), axis=[1, 2, 3])
+    loss_diff_mse = jnp.fft.rfft2(eps - eps_hat, axes=[1,2])
+    loss_diff_mse = (jnp.square(loss_diff_mse.real) + jnp.square(loss_diff_mse.imag)) / self.z_std
+    loss_diff_snr = loss_diff_mse * (jnp.sqrt(var_t) / jnp.sqrt(1 - var_t))
     _, g_t_grad = jax.jvp(self.gamma, (t,), (jnp.ones_like(t),))
     s = t - (1./T)
     g_s = self.gamma(s)
+
+    recon = conv_gamma(1/jnp.sqrt(1 - var_t) ,z_t - conv_gamma(jnp.sqrt(var_t), eps_hat))
 
     return VDMLog(
         loss_diff=loss_diff_mse,
@@ -267,11 +279,13 @@ class VDM(nn.Module):
         g_t_grad=g_t_grad,
         exp_g_t=jnp.expm1(g_t),
         snr_discrete=jnp.expm1(g_t - g_s),
-        eps=eps,
-        eps_hat=eps_hat,
+        eps=conv_gamma(jnp.sqrt(var_t), eps),
+        eps_hat=conv_gamma(jnp.sqrt(var_t), eps_hat),
         f=f,
+        z_t=z_t,
         alpha_t=jnp.sqrt(1 - var_t),
-        sigma_t=jnp.sqrt(var_t)
+        sigma_t=jnp.sqrt(var_t),
+        recon=recon
     )
   
   def sample(self, i, T, z_t, conditioning, rng):
@@ -283,6 +297,14 @@ class VDM(nn.Module):
     s = (T - i - 1) / T
 
     g_s, g_t = self.gamma(s), self.gamma(t)
+    var_t , var_s = nn.sigmoid(g_t), nn.sigmoid(g_s)
+    sigma_t, sigma_s = jnp.sqrt(var_t), jnp.sqrt(var_s)
+    # alpha_t, alpha_s = jnp.sqrt(nn.sigmoid(-g_t)), jnp.sqrt(nn.sigmoid(-g_s))
+    # mu_t, mu_s = jnp.sqrt(1 - var_t), jnp.sqrt(1 - var_s)
+    alpha_st = jnp.sqrt(nn.sigmoid(-g_s) / nn.sigmoid(-g_t))
+    # sigma_ts = (sigma_t ** 2) - (sigma_s / alpha_st) ** 2 
+    # mu_ts = jnp.fft.irfft2((1 - 1 / alpha_st) * self.z_mean, axes=[1,2])
+
     eps_hat = self.score_model(
         z_t,
         # g_t * jnp.ones((z_t.shape[0],), g_t.dtype),
@@ -290,18 +312,18 @@ class VDM(nn.Module):
         conditioning,
         deterministic=True)
     a = nn.sigmoid(-g_s)
-    b = nn.sigmoid(-g_t)
+    # b = nn.sigmoid(-g_t)
     c = - jnp.expm1(g_s - g_t)
-    sigma_t = jnp.sqrt(nn.sigmoid(g_t))
-    alpha_st = jnp.sqrt(nn.sigmoid(-g_s) / nn.sigmoid(-g_t))
 
     # z_s = jnp.sqrt(nn.sigmoid(-g_s) / nn.sigmoid(-g_t)) * (z_t - sigma_t * c * eps_hat) + \
     #     jnp.sqrt((1. - a) * c) * eps
-    z_s = conv_gamma(alpha_st, z_t) + \
-        (- conv_gamma(alpha_st * sigma_t * c , eps_hat)) + \
-        conv_gamma(jnp.sqrt((1. - a) * c) ,eps)
 
-    return z_s
+    z_t_coeff = conv_gamma(alpha_st, z_t)
+    eps = conv_gamma(jnp.sqrt((1. - a) * c) ,eps)
+    eps_hat = conv_gamma(alpha_st * (-sigma_t * c), eps_hat)
+    z_s = z_t_coeff + eps_hat + eps
+
+    return z_s #, z_t_coeff, eps_hat, eps
 
   def generate_x(self, z_0):
     g_0 = self.gamma(0.)
