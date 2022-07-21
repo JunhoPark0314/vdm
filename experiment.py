@@ -38,11 +38,11 @@ import tensorflow as tf
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from scipy.stats import gaussian_kde
+from flax.core.frozen_dict import FrozenDict
 
 import vdm.train_state
 import vdm.utils as utils
 import vdm.dataset as dataset
-
 
 class Experiment(ABC):
   """Boilerplate for training and evaluating VDM models."""
@@ -62,7 +62,7 @@ class Experiment(ABC):
     # initialize model
     logging.warning('=== Initializing model ===')
     self.rng, model_rng = jax.random.split(self.rng)
-    self.model, params = self.get_model_and_params(model_rng)
+    self.model, params = self.get_model_and_params(model_rng, next(self.phase_iter))
     parameter_overview.log_parameter_overview(params)
 
     # initialize train state
@@ -120,6 +120,16 @@ class Experiment(ABC):
     else:
       self.T_list = [10, 100, 250, 500, 1000, -1]
 
+        
+    # if self.config.training.optimal_compare:
+    if False:
+      self.rng, data_model_rng = jax.random.split(self.rng)
+      self.data_model, data_params, database = self.get_data_model(self.eval_iter, data_model_rng)
+
+      self.p_opt_step = functools.partial(self.opt_step, params=data_params, database=database)
+      # self.p_opt_step = functools.partial(jax.lax.scan, self.p_opt_step)
+      self.p_opt_step = jax.pmap(self.p_opt_step, "batch")
+
     logging.info('=== Done with Experiment.__init__ ===')
 
   def get_lr_schedule(self):
@@ -175,6 +185,11 @@ class Experiment(ABC):
     return optimizer
 
   @abstractmethod
+  def get_data_model(self):
+    """Return the data model."""
+    ...
+
+  @abstractmethod
   def get_model_and_params(self, rng: PRNGKey):
     """Return the model and initialized parameters."""
     ...
@@ -185,7 +200,7 @@ class Experiment(ABC):
     ...
 
   @abstractmethod
-  def loss_fn(self, params, batch, rng, is_train, T_eval) -> Tuple[float, Any]:
+  def loss_fn(self, params, batch_stat, batch, rng, is_train, T_eval) -> Tuple[float, Any]:
     """Loss function and metrics."""
     ...
 
@@ -250,6 +265,16 @@ class Experiment(ABC):
           batch = jax.tree_map(jnp.asarray, batch)
           state, _train_metrics = self.p_train_step(state, batch)
 
+          # grads = flax_utils.unreplicate(_train_metrics["grads"])
+          # flat_grads = flax.traverse_util.flatten_dict(unfreeze(grads))
+          # nan_grads = []
+          # for k, v in flat_grads.items():
+          #   if jnp.isnan(v).any():
+          #     nan_grads.append(k)
+          
+          # if len(nan_grads):
+          #   print(nan_grads)
+
         # Quick indication that training is happening.
         logging.log_first_n(
             logging.WARNING, 'Finished training step %d.', 3, step)
@@ -281,7 +306,7 @@ class Experiment(ABC):
                 batch.update({"T_eval": tf.ones((B, 1)) * t})
                 batch = jax.tree_map(jnp.asarray, batch)
                 metrics = self.p_eval_step(
-                    state.ema_params, batch, flax_utils.replicate(eval_step))
+                    state.ema_params, state.ema_batch_stats, batch, flax_utils.replicate(eval_step))
                 eval_metrics.append(metrics[f'scalars'])
 
               # average over eval metrics
@@ -296,7 +321,7 @@ class Experiment(ABC):
             images = metrics['images']
             for t in T_list[:-1]:
               logging.info(f'=== Sampling Images (t_eval: {t:05d}) ===')
-              samples = self.p_sample(params=state.ema_params, T=flax_utils.replicate(jnp.ones([t,0])))
+              samples = self.p_sample(params=state.ema_params, batch_stats=state.ema_batch_stats, T=flax_utils.replicate(jnp.ones([t,0])))
               samples = jnp.squeeze(samples['z_s'], axis=1)
               samples = utils.generate_image_grids(samples)[None, :, :, :]
               images[f'samples/{t:05d}'] = samples.astype(np.uint8)
@@ -325,6 +350,29 @@ class Experiment(ABC):
     writer = metric_writers.create_default_writer(
         eval_logdir, just_logging=jax.process_index() > 0)
 
+    # from PIL import Image
+
+    # def toImage(arr, path):
+    #   igrid = utils.generate_image_grids(np.array(jnp.clip(arr * 127.5 + 127.5, a_min=0, a_max=255)).astype(np.uint8))
+    #   Image.fromarray(np.array(igrid)).save(path)
+
+    # # T_list = [1000,-1]
+    # for t in T_list[:-1]:
+    #   model_output = self.p_sample_seq(params=params, batch_stats=None, T=flax_utils.replicate(jnp.ones([t,0])))
+    #   for k, v in model_output.items():
+    #     v_shape = v.shape
+    #     model_output[k] = v.reshape(4, -1, *v_shape[1:])
+      
+    #   optimal_output = self.p_opt_step(model_output)
+    #   optimal_output = flax_utils.unreplicate(optimal_output)
+
+    #   for k, v in model_output.items():
+    #     v_shape = v.shape
+    #     model_output[k] = v.reshape(-1, *v_shape[2:])
+      
+    #   print(1)
+
+
     # for t in T_list[:-1]:
     #   eval_metrics = []
     #   for eval_step in range(self.config.training.num_steps_eval):
@@ -343,19 +391,22 @@ class Experiment(ABC):
 
     # sample a batch of images
 
-    # images = {}
-    # # T_list = [10, 100, 250, 500, 1000]
-    # for t in T_list[:-1]:
-    #   seq_samples = self.p_sample_seq(params=params, T=flax_utils.replicate(jnp.ones([t,0])))["z_s"][:,-1,...]
-    #   seq_samples = utils.generate_image_grids(seq_samples)[None, :, :, :]
-    #   # samples = {'samples': samples.astype(np.uint8)}
-    #   from PIL import Image
-    #   images[f'eval_samples/{t:05d}'] = seq_samples.astype(np.uint8)
+    # save_images = True
+    # if save_images:
+    #   images = {}
+    #   # # T_list = [10, 100, 250, 500, 1000]
+    #   for t in T_list[:-1]:
+    #     seq_samples = self.p_sample_seq(params=params, T=flax_utils.replicate(jnp.ones([t,0])))
+    #     seq_samples = seq_samples["z_s"][:,-1,...]
+    #     seq_samples = utils.generate_image_grids(seq_samples)[None, :, :, :]
+    #     # samples = {'samples': samples.astype(np.uint8)}
+    #     from PIL import Image
+    #     images[f'eval_samples/{t:05d}'] = seq_samples.astype(np.uint8)
 
-    # for k,v in images.items():
-    #   Image.fromarray(np.array(v[0])).save(f'vdm/evolve/cifar10_conv/{k}.png')
+    #   for k,v in images.items():
+    #     Image.fromarray(np.array(v[0])).save(f'vdm/evolve/cifar10_aa/{k}.png')
 
-    # writer.write_images(step, images)
+      # writer.write_images(step, images)
 
     cm = ['b','r','g','y','c']
     handles = []
@@ -578,12 +629,18 @@ class Experiment(ABC):
     rng = jax.random.fold_in(rng, state.step)
 
     grad_fn = jax.value_and_grad(self.loss_fn, has_aux=True)
-    (_, metrics), grads = grad_fn(state.params, batch, rng=rng, is_train=True)
+    (_, metrics), grads = grad_fn(state.params, state.batch_stats, batch, rng=rng, is_train=True)
     grads = jax.lax.pmean(grads, "batch")
+    stat_update = None
+    if ("stat_update" in metrics) and (metrics["stat_update"] is not None):
+      # stat_update = metrics.pop('stat_update')
+      # stat_update = jax.lax.pmean(metrics.pop("stat_update"), "batch")
+      stat_update = jax.lax.pmean(metrics["stat_update"]['batch_stats'], "batch")
+      metrics.pop('stat_update')
 
     learning_rate = self.lr_schedule(state.step)
     new_state = state.apply_gradients(
-        grads=grads, lr=learning_rate, ema_rate=self.config.optimizer.ema_rate)
+        grads=grads, lr=learning_rate, ema_rate=self.config.optimizer.ema_rate, stat_update=stat_update)
 
     metrics['scalars'] = jax.tree_map(
         lambda x: jax.lax.pmean(x, axis_name="batch"), metrics['scalars'])
@@ -594,13 +651,16 @@ class Experiment(ABC):
         lambda x: utils.generate_image_grids(x)[None, :, :, :],
         metrics['images'])
 
+    # metrics["grads"] = grads
+
     return new_state, metrics
 
-  def eval_step(self, base_rng, params, batch, eval_step=0):
+  def eval_step(self, base_rng, params, batch_stat, batch, eval_step=0):
     rng = jax.random.fold_in(base_rng, jax.lax.axis_index('batch'))
     rng = jax.random.fold_in(rng, eval_step)
 
-    _, metrics = self.loss_fn(params, batch, rng=rng, is_train=False)
+
+    _, metrics = self.loss_fn(params, batch_stat, batch, rng=rng, is_train=False)
 
     # summarize metrics
     metrics['scalars'] = jax.lax.pmean(
@@ -611,6 +671,8 @@ class Experiment(ABC):
     metrics['images'] = jax.tree_map(
         lambda x: utils.generate_image_grids(x)[None, :, :, :],
         metrics['images'])
+    
+    metrics.pop('stat_update')
 
     return metrics
   
@@ -621,6 +683,55 @@ class Experiment(ABC):
     logs = self.mse_fn(params, batch, rng=rng, is_train=False)
 
     return logs
+
+  def opt_step(self, batch, params, database):
+    B, T, H, W, C = batch["eps"].shape
+    state = {
+      "g_s": batch["g_s"],
+      "g_t": batch["g_t"],
+      "eps": batch["eps"],
+      "z_t": batch["z_t"],
+      "z_s_opt": batch["z_s"].transpose(1,0,2,3,4),
+      "eps_hat_opt": batch["z_s"].transpose(1,0,2,3,4),
+      "opt_dn": batch["z_s"].transpose(1,0,2,3,4),
+    }
+
+    def body_fn(i, state):
+      results = self.state.apply_fn(
+          variables={'params': params},
+          database=database,
+          g_s=state["g_s"][:,i+1,...],
+          g_t=state["g_t"][:,i+1,...],
+          z_t=state["z_t"][:,i+1,...],
+          eps=state["eps"][:,i+1,...],
+          method=self.data_model.sample,
+      )
+      for k, v in results.items():
+        if k in state:
+          state[k] = state[k].at[i+1].set(v)
+      
+      return state
+
+    state = jax.lax.fori_loop(
+        lower=0, upper=T, body_fun=body_fn, init_val=state)
+    
+    result = {
+      "z_s_opt": state["z_s_opt"],
+      "eps_hat_opt": state["eps_hat_opt"],
+      "opt_dn": state["opt_dn"]
+    }
+
+    for k, v in result.items():
+      v = jnp.reshape(v, (-1, H, W, C))
+      samples = v
+      # samples = self.state.apply_fn(
+      #     variables={'params': params},
+      #     z_0=v,
+      #     method=self.model.generate_x,
+      # )
+      result[k] = samples.reshape(T, B, H, W, C).transpose(1, 0, 2, 3, 4)
+
+    return result
 
 def copy_dict(dict1, dict2):
   if not isinstance(dict1, dict):

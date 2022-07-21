@@ -39,13 +39,17 @@ class VDMConfig:
   gamma_max: float
   gamma_out: int
 
+  # configurations of the phase schedule
+  phase_out: int
+
   # configurations of the score model
   sm_n_timesteps: int
   sm_n_embd: int
   sm_n_layer: int
   sm_pdrop: float
   sm_kernel_init: Callable = jax.nn.initializers.normal(0.02)
-  gamma_shape: tuple = (1,1)
+  gamma_shape: tuple = (1,1,1)
+  phase_shape: tuple = (1,1,1)
 
 
 
@@ -56,17 +60,20 @@ def conv_gamma(gamma, f):
     N,H,W,C = f.shape
     D = 1
     ft = f.transpose(3,1,2,0)
-    G = int(N / gamma.shape[0])
+    # G = int(N / gamma.shape[0])
   elif len(f.shape) == 5:
     N,H,W,C,D = f.shape
     ft = f.transpose(3,1,2,0,4).reshape(C,H,W,N*D)
     G = int(N*D / gamma.shape[0])
+    gamma = jnp.repeat(gamma, G, axis=0)
   
+  gamma = gamma.transpose(3, 1, 2, 0)
   # normalizer = np.sqrt(np.prod(gamma.shape[1:]))
   fft_ft = jnp.fft.rfft2(ft, axes=[1,2])
-  ft = jnp.fft.irfft2(fft_ft * jnp.repeat(gamma, G, axis=0).transpose(3,1,2,0), axes=[1, 2])
-  # ft = jax.lax.conv_general_dilated(ft, jnp.repeat(gamma, G, axis=0), window_strides=(1,1), padding="SAME", 
-  #   feature_group_count=N*D,dimension_numbers=("NHWC", "OIHW", "NHWC"))
+  real_p, imag_p = gamma[:3], gamma[3:]
+  # fft_ft_g = fft_ft * (jnp.repeat(gamma, G, axis=0)).transpose(3,1,2,0)
+  ft = jax.lax.complex(fft_ft.real * real_p, fft_ft.imag * imag_p)
+  ft = jnp.fft.irfft2(ft, axes=[1, 2])
 
   if len(f.shape) == 4:
     ft = ft.transpose(3,1,2,0)
@@ -74,6 +81,8 @@ def conv_gamma(gamma, f):
     ft = ft.reshape(C, H, W, N, D).transpose(3,1,2,0,4)
   return ft #/ normalizer
 
+def redp(mag, phase):
+  return jnp.tile(mag, (1,1,1,2)) * phase
 
 
 @flax.struct.dataclass
@@ -83,6 +92,10 @@ class VDMOutput:
   loss_diff: chex.Array  # [B]
   var_0: float
   var_1: float
+  # z_t: chex.Array
+  # log_snr_t_grad: chex.Array
+  # mse_real : chex.Array
+  # mse_imag : chex.Array
 
 @flax.struct.dataclass
 class VDMLog:
@@ -119,6 +132,10 @@ class VDM(nn.Module):
     else:
       raise Exception("Unknown self.var_model")
     
+    self.phase_noise = PhaseSchedule_FFT_NNet(self.config)
+    self.phase_signal = PhaseSchedule_FFT_NNet(self.config)
+    self.phase_emb = PhaseEmb_NNet(self.config)
+  
   def __call__(self, images, conditioning, T_eval, deterministic: bool = True, use_t_eval: bool = False):
     g_0, g_1 = self.gamma(0.), self.gamma(1.)
     var_0, var_1 = nn.sigmoid(g_0), nn.sigmoid(g_1)
@@ -127,29 +144,37 @@ class VDM(nn.Module):
     n_batch = images.shape[0]
     t_eval = T_eval
 
+
+
     # encode
     f = self.encdec.encode(x)
+    fp_emb = self.phase_emb(f)
+    pn_0, pn_1 = self.phase_noise(0., fp_emb), self.phase_noise(1, fp_emb)
+    ps_0, ps_1 = self.phase_signal(0., fp_emb, ret=True), self.phase_signal(1, fp_emb, ret=True)
+
 
     # 1. RECONSTRUCTION LOSS
     # add noise and reconstruct
     # eps_0 = jax.random.normal(self.make_rng("sample"), shape=f.shape)
-    eps_0 = self.sample_eps(self.make_rng("sample"), (f.shape[0],*self.config.gamma_shape,f.shape[-1]))
-    # eps_0 = jax.random.normal(self.make_rng("sample"), shape=self.config.gamma_shape)
+    eps_0 = self.sample_eps(self.make_rng("sample"), (f.shape[0],*self.config.gamma_shape[:2],f.shape[-1]))
     # eps_0 = eps_0 * self.config.z_std + self.config.z_mean
     # eps_0 = jnp.fft.rfft2(eps_0, axes=[1,2])
 
     # z_0 = jnp.sqrt(1. - var_0) * f + jnp.sqrt(var_0) * eps_0
     # z_0_rescaled = f + jnp.exp(0.5 * g_0) * eps_0 # = z_0/sqrt(1-var)
-    z_0_rescaled = f + conv_gamma(jnp.exp(0.5 * g_0), eps_0) #+ jnp.fft.irfft2(mu_0 * self.z_mean, axes=[1,2]) # = z_0/sqrt(1-var)
-    loss_recon = - self.encdec.logprob(x, z_0_rescaled, g_0)
+    z_0_rescaled = f + conv_gamma(redp(jnp.exp(0.5*g_0), pn_0/ps_0), eps_0) #+ jnp.fft.irfft2(mu_0 * self.z_mean, axes=[1,2]) # = z_0/sqrt(1-var)
+    # z_0 = conv_gamma(jnp.sqrt(1. - var_0), f, ps_0) + conv_gamma(jnp.sqrt(var_0), eps_0, pn_0)
+    # z_0_rescaled = conv_gamma(1 / jnp.sqrt(1 - var_0), z_0, 1 / ps_0)
+    loss_recon = - self.encdec.logprob(x, z_0_rescaled, g_0, 1)
 
     # 2. LATENT LOSS
     # KL z1 with N(0,1) prior
     # mean1_sqr = (1. - var_1) * jnp.square(f)
 
-    mean1_sqr = jnp.fft.rfft2(conv_gamma(jnp.sqrt(1. - var_1), f), axes=[1,2]) #+ (mu_1 - 1) * self.z_mean
-    mean_diff = (jnp.square(mean1_sqr.real) + jnp.square(mean1_sqr.imag))
-    loss_klz = 0.5 * jnp.sum(mean_diff / (self.z_std * 0.5) + var_1 - jnp.log(var_1) - 1, axis=(1, 2, 3))
+    mean1_sqr = jnp.fft.rfft2(conv_gamma(redp(jnp.sqrt(1. - var_1), ps_1), f), axes=[1,2]) #+ (mu_1 - 1) * self.z_mean
+    mean_diff = jnp.concatenate([jnp.square(mean1_sqr.real),jnp.square(mean1_sqr.imag)], axis=-1)
+    var_kl = (pn_1 ** 2) * jnp.tile(var_1, (1,1,1,2))
+    loss_klz = 0.5 * jnp.sum(mean_diff / (jnp.tile(self.z_std, (1,1,1,2)) * 0.5) + var_kl - jnp.log(var_kl) - 1, axis=(1, 2, 3))
 
     # loss_klz = jnp.fft.ifft2(loss_klz, axes=[1,2])
 
@@ -172,30 +197,39 @@ class VDM(nn.Module):
 
     # sample z_t
     g_t = self.gamma(t)
+    ps_t, pn_t = self.phase_signal(t, fp_emb, ret=True), self.phase_noise(t, fp_emb)
+  
     # var_t = nn.sigmoid(g_t)[:, None, None, None]
     var_t = nn.sigmoid(g_t)#[:, None, None, None]
-    mu_t = (1 - jnp.sqrt(1. - var_t))
     # eps = jax.random.normal(self.make_rng("sample"), shape=f.shape)
-    eps = self.sample_eps(self.make_rng("sample"), (f.shape[0],*self.config.gamma_shape,f.shape[-1]))
+    eps = self.sample_eps(self.make_rng("sample"), (f.shape[0],*self.config.gamma_shape[:2],f.shape[-1]))
     # z_t = jnp.sqrt(1. - var_t) * f + jnp.sqrt(var_t) * eps
-    z_t = conv_gamma(jnp.sqrt(1. - var_t), f) + conv_gamma(jnp.sqrt(var_t), eps) #+ jnp.fft.irfft2(mu_t * self.z_mean, axes=[1,2])
+    z_t = conv_gamma(redp(jnp.sqrt(1. - var_t), ps_t), f) + conv_gamma(redp(jnp.sqrt(var_t), pn_t), eps) #+ jnp.fft.irfft2(mu_t * self.z_mean, axes=[1,2])
+
     # compute predicted noise
     eps_hat = self.score_model(z_t, g_t, conditioning, deterministic)
+
     # compute MSE of predicted noise
     # loss_diff_mse = jnp.sum(jnp.square(eps - eps_hat), axis=[1, 2, 3])
     loss_diff_mse = jnp.fft.rfft2(eps - eps_hat, axes=[1,2])
-    loss_diff_mse = (jnp.square(loss_diff_mse.real) + jnp.square(loss_diff_mse.imag)) / (self.z_std * 0.5)
-
+    loss_diff_mse_real = jnp.square(loss_diff_mse.real) / (self.z_std * 0.5)
+    loss_diff_mse_imag = jnp.square(loss_diff_mse.imag) / (self.z_std * 0.5)
 
     if (self.config.sm_n_timesteps == 0) and (use_t_eval == False):
       # loss for infinite depth T, i.e. continuous time
-      _, g_t_grad = jax.jvp(self.gamma, (t,), (jnp.ones_like(t),))
-      loss_diff = .5 * g_t_grad * loss_diff_mse
+      _, log_snr_t_grad = jax.jvp(self.log_snr_t, (t,fp_emb), (jnp.ones_like(t), jnp.ones_like(fp_emb)))
+      # loss_diff = .5 * (log_snr_t_grad[...,:3] * loss_diff_mse_real + 
+      #       log_snr_t_grad[...,3:] * loss_diff_mse_imag)
     else:
       # loss for finite depth T, i.e. discrete time
       s = t - (1./T)
       g_s = self.gamma(s)
-      loss_diff = .5 * T * jnp.expm1(g_t - g_s) * loss_diff_mse
+      ps_s, pn_s = self.phase_signal(s, fp_emb, ret=True), self.phase_noise(s, fp_emb)
+      log_snr_t_grad = jnp.expm1(jnp.tile(g_t - g_s, (1,1,1,2)) + jnp.log((ps_s * pn_t) / (pn_s * ps_t))) * T
+      # loss_diff = .5 * loss_diff_mse
+    
+    loss_diff = .5 * (log_snr_t_grad[...,:3] * loss_diff_mse_real + 
+          log_snr_t_grad[...,3:] * loss_diff_mse_imag)
 
     loss_diff = jnp.sum(loss_diff, axis=[1, 2, 3])
 
@@ -207,7 +241,21 @@ class VDM(nn.Module):
         loss_diff=loss_diff,
         var_0=jnp.linalg.norm(var_0) / np.sqrt(self.config.gamma_out),
         var_1=jnp.linalg.norm(var_1) / np.sqrt(self.config.gamma_out),
+        # z_t = z_t,
+        # log_snr_t_grad = log_snr_t_grad,
+        # mse_real = loss_diff_mse_real,
+        # mse_imag = loss_diff_mse_imag
     )
+
+
+  
+  def log_snr_t(self, t, f):
+    g_t = jnp.tile(self.gamma(t), (1,1,1,2))
+    ps_t, pn_t = self.phase_signal(t, f, ret=True), self.phase_noise(t, f)
+
+    return g_t - jnp.log((ps_t / pn_t))
+
+
 
   def sample_eps(self, rng, shape, axes=[1,2], use_var1=False):
     real_rng, imag_rng = jax.random.split(rng)
@@ -264,7 +312,7 @@ class VDM(nn.Module):
     var_t = nn.sigmoid(g_t)#[:, None, None, None]
     mu_t = (1 - jnp.sqrt(1. - var_t))
     # eps = jax.random.normal(self.make_rng("sample"), shape=f.shape)
-    eps = self.sample_eps(self.make_rng("sample"), (f.shape[0],*self.config.gamma_shape,f.shape[-1]))
+    eps = self.sample_eps(self.make_rng("sample"), (f.shape[0],*self.config.gamma_shape[:2],f.shape[-1]))
     # z_t = jnp.sqrt(1. - var_t) * f + jnp.sqrt(var_t) * eps
     z_t = conv_gamma(jnp.sqrt(1. - var_t), f) + conv_gamma(jnp.sqrt(var_t), eps) #+ jnp.fft.irfft2(mu_t * self.z_mean, axes=[1,2])
     # compute predicted noise
@@ -299,17 +347,22 @@ class VDM(nn.Module):
   
   def sample(self, i, T, z_t, conditioning, rng):
     rng_body = jax.random.fold_in(rng, i)
-    eps = self.sample_eps(rng_body, (z_t.shape[0],*self.config.gamma_shape,z_t.shape[-1]))
+    eps = self.sample_eps(rng_body, (z_t.shape[0],*self.config.gamma_shape[:2],z_t.shape[-1]))
     # eps = jax.random.normal(rng_body, z_t.shape)
 
     t = (T - i) / T
     s = (T - i - 1) / T
 
     g_s, g_t = self.gamma(s), self.gamma(t)
+    zp_emb = self.phase_emb(z_t)
+    ps_t, pn_t = self.phase_signal(t, zp_emb, ret=True), self.phase_noise(t, zp_emb)
+    ps_s, pn_s = self.phase_signal(s, zp_emb, ret=True), self.phase_noise(s, zp_emb)
+
     var_t , var_s = nn.sigmoid(g_t), nn.sigmoid(g_s)
     sigma_t, sigma_s = jnp.sqrt(var_t), jnp.sqrt(var_s)
     # mu_t, mu_s = jnp.sqrt(1 - var_t), jnp.sqrt(1 - var_s)
     alpha_st = jnp.sqrt(nn.sigmoid(-g_s) / nn.sigmoid(-g_t))
+    ps_st = ps_s / ps_t
     # sigma_ts = (sigma_t ** 2) - (sigma_s / alpha_st) ** 2 
     # mu_ts = jnp.fft.irfft2((1 - 1 / alpha_st) * self.z_mean, axes=[1,2])
 
@@ -319,17 +372,19 @@ class VDM(nn.Module):
         g_t,
         conditioning,
         deterministic=True)
-    a = nn.sigmoid(-g_s)
+    # a = nn.sigmoid(-g_s)
     # b = nn.sigmoid(-g_t)
-    c = - jnp.expm1(g_s - g_t)
-
+    p_c = jnp.log(((ps_t * pn_s) / (pn_t * ps_s)) ** 2)
+    c = - jnp.expm1(jnp.tile(g_s - g_t, (1,1,1,2)) + p_c)
+    alpha_st = redp(alpha_st, ps_st)
+    
     # z_s = jnp.sqrt(nn.sigmoid(-g_s) / nn.sigmoid(-g_t)) * (z_t - sigma_t * c * eps_hat) + \
     #     jnp.sqrt((1. - a) * c) * eps
 
     z_t_coeff = conv_gamma(alpha_st, z_t)
-    eps = conv_gamma(jnp.sqrt((1. - a) * c) ,eps)
-    eps_hat = conv_gamma(alpha_st * (-sigma_t * c), eps_hat)
-    z_s = z_t_coeff + eps_hat + eps
+    eps = conv_gamma(jnp.sqrt(redp(var_s, pn_s**2) * c) ,eps)
+    eps_hat = conv_gamma(alpha_st * c * redp(sigma_t, pn_t), eps_hat)
+    z_s = z_t_coeff - eps_hat + eps
 
     results = {
       "z_s": z_s,
@@ -339,10 +394,13 @@ class VDM(nn.Module):
 
   def generate_x(self, z_0):
     g_0 = self.gamma(0.)
-
     var_0 = nn.sigmoid(g_0)
+    fp_emb = self.phase_emb(z_0)
+    ps_0 = self.phase_signal(0, fp_emb)
+    weight = redp(1 / jnp.sqrt(1. - var_0), 1 / ps_0)
+
     # z_0_rescaled = z_0 / jnp.sqrt(1. - var_0)
-    z_0_rescaled = conv_gamma(1 / jnp.sqrt(1. - var_0), z_0)
+    z_0_rescaled = conv_gamma(weight, z_0)
 
     logits = self.encdec.decode(z_0_rescaled, g_0)
 
@@ -375,7 +433,7 @@ class EncDec(nn.Module):
     x = x.round()
     return 2 * ((x+.5) / self.config.vocab_size) - 1
 
-  def decode(self, z, g_0):
+  def decode(self, z, g_0, p=1):
     config = self.config
 
     # Logits are exact if there are no dependencies between dimensions of x
@@ -385,15 +443,15 @@ class EncDec(nn.Module):
     # inv_stdev = jnp.exp(-0.5 * g_0[..., None])
     # logits = -0.5 * jnp.square((z[..., None] - x_vals) * inv_stdev)
     inv_stdev = jnp.exp(-0.5 * g_0)
-    logits = -0.5 * jnp.square(conv_gamma(inv_stdev, (z[..., None] - x_vals)))
+    logits = -0.5 * jnp.square(conv_gamma(redp(inv_stdev, p), (z[..., None] - x_vals)))
 
     logprobs = jax.nn.log_softmax(logits)
     return logprobs
 
-  def logprob(self, x, z, g_0):
+  def logprob(self, x, z, g_0, p):
     x = x.round().astype('int32')
     x_onehot = jax.nn.one_hot(x, self.config.vocab_size)
-    logprobs = self.decode(z, g_0)
+    logprobs = self.decode(z, g_0, p)
     logprob = jnp.sum(x_onehot * logprobs, axis=(1, 2, 3, 4))
     return logprob
 
@@ -429,8 +487,7 @@ class ScoreUNet(nn.Module):
 
     # Concatenate Fourier features to input
     if config.with_fourier_features:
-      z_f = Base2FourierFeatures(start=6, stop=8, step=1, z_std=z_std)(z)
-      # z_f = OptBase2FourierFeatures(init_start=6, init_dist=jnp.log(8 - 6))(z, temb)
+      z_f = Base2FourierFeatures(start=6, stop=8, step=1)(z)
       h = jnp.concatenate([z, z_f], axis=-1)
     else:
       h = z
@@ -593,7 +650,6 @@ class NoiseSchedule_FFT_NNet(nn.Module):
     init_bias = self.config.gamma_min
     init_scale = self.config.gamma_max - init_bias
 
-    self.freq = self.param('freq', nn.initializers.uniform(1.0), (1, n_out, 2))
     self.l1 = DenseMonotone(n_out,
                             kernel_init=constant_init(init_scale),
                             bias_init=constant_init(init_bias))
@@ -618,8 +674,66 @@ class NoiseSchedule_FFT_NNet(nn.Module):
       _h = self.l3(_h) / self.n_features
       h += _h
 
-    return h.reshape((h.shape[0],) + self.gamma_shape + (1,))
+    return h.reshape((h.shape[0],) + self.gamma_shape)
 
+class PhaseSchedule_FFT_NNet(nn.Module):
+  config: VDMConfig
+  n_features: int = 256
+  n_emb: int = 64
+  nonlinear: bool = True
+
+  def setup(self):
+    config = self.config
+
+    self.phase_shape = config.phase_shape
+    n_out = config.phase_out
+
+    self.l1 = nn.Dense(features=self.n_emb)
+    self.t1 = nn.Dense(features=self.n_emb)
+    self.a1 = AttnBlock(num_heads=1)
+    if self.nonlinear:
+      self.l2 = nn.Dense(self.n_features)
+      self.l3 = nn.Dense(self.n_emb, use_bias=False)
+    
+    self.ca = CrossAttnBlock(num_heads=1)
+    self.reduce = nn.Dense(features=self.phase_shape[-1]*2)
+  
+  @nn.compact
+  def __call__(self, t, x, det_min_max=False, ret=True):
+    assert jnp.isscalar(t) or len(t.shape) == 0 or len(t.shape) == 1
+
+    if ret:
+      out = jnp.zeros_like(x)
+    else:
+      x_emb = Base2FourierFeatures()(x)
+      t_emb = Base2FourierFeatures(t)
+      h = self.l1(x_emb)
+      t_emb = self.t1(t_emb)
+      h = self.a1(h)
+      if self.nonlinear:
+        _h = self.l2(x_emb)
+        _h = 2 * (nn.sigmoid(_h) - .5)  # more stable than jnp.tanh(h)
+        _h = self.l3(_h) / self.n_features
+        h += _h
+      
+      h = self.ca(h, t_emb)
+      out = self.reduce(h)
+
+    # out = jnp.concatenate([jnp.sqrt(2 * nn.sigmoid(out)), jnp.sqrt(2 * nn.sigmoid(-out))], axis=-1)
+    out = jnp.sqrt(nn.sigmoid(out) * 2)
+
+    return out
+
+class PhaseEmb_NNet(nn.Module):
+  config: VDMConfig
+
+  @nn.compact
+  def __call__(self, x, deterministic=True,):
+
+    fft_x = jnp.fft.rfft2(x, axes=[1,2])
+    mag_x = jnp.absolute(fft_x)
+    phase_x = jnp.concatenate([fft_x.real / mag_x, fft_x.imag / mag_x], axis=-1)
+    return phase_x
 
 def constant_init(value, dtype='float32'):
   def _init(key, shape, dtype=dtype):
@@ -752,6 +866,52 @@ class AttnBlock(nn.Module):
     assert h.shape == x.shape
     return x + h
 
+class CrossAttnBlock(nn.Module):
+  """Self-attention residual block."""
+
+  num_heads: int
+
+  @nn.compact
+  def __call__(self, x, t):
+    B, H, W, C = x.shape  # pylint: disable=invalid-name,unused-variable
+    B, C = t.shape
+    assert C % self.num_heads == 0
+
+    x_normalize = nn.normalization.GroupNorm()
+    # t_normalize = nn.normalization.GroupNorm()
+
+    h = x_normalize(x)
+    # th = t_normalize(t)
+    th = t
+    if self.num_heads == 1:
+      q = nn.Dense(features=C, name='q')(th)
+      k = nn.Dense(features=C, name='k')(h)
+      v = nn.Dense(features=C, name='v')(h)
+      q = jnp.tile(q[:, None, None, :], (1, H, W, 1))
+      h = dot_product_attention(
+          q[:, :, :, None, :],
+          k[:, :, :, None, :],
+          v[:, :, :, None, :],
+          axis=(1, 2))[:, :, :, 0, :]
+      h = nn.Dense(
+          features=C, kernel_init=nn.initializers.zeros, name='proj_out')(h)
+    else:
+      head_dim = C // self.num_heads
+      q = nn.DenseGeneral(features=(self.num_heads, head_dim), name='q')(th)
+      q = jnp.tile(q[:, None, None, :, :], (1, H, W, 1, 1))
+      k = nn.DenseGeneral(features=(self.num_heads, head_dim), name='k')(h)
+      v = nn.DenseGeneral(features=(self.num_heads, head_dim), name='v')(h)
+      # assert q.shape == k.shape == v.shape == (
+      #     B, H, W, self.num_heads, head_dim)
+      h = dot_product_attention(q, k, v, axis=(1, 2))
+      h = nn.DenseGeneral(
+          features=C,
+          axis=(-2, -1),
+          kernel_init=nn.initializers.zeros,
+          name='proj_out')(h)
+
+    # assert h.shape == x.shape
+    return x + h
 
 def dot_product_attention(query,
                           key,
@@ -862,7 +1022,6 @@ def _invert_perm(perm):
 
 
 class Base2FourierFeatures(nn.Module):
-  z_std: chex.Array
   start: int = 0
   stop: int = 8
   step: int = 1
@@ -879,31 +1038,4 @@ class Base2FourierFeatures(nn.Module):
     h = jnp.repeat(inputs, len(freqs), axis=-1)
     h = w * h
     h = jnp.concatenate([jnp.sin(h), jnp.cos(h)], axis=-1)
-    return h
-
-class OptBase2FourierFeatures(nn.Module):
-  init_start: int = 0
-  init_dist: int = jnp.log(8 - 0)
-  num_step: int = 6
-  n_feat: int = 128
-
-  @nn.compact
-  def __call__(self, inputs, temb):
-    start = self.param("Freq_start", constant_init(self.init_start), (1,))
-    dist = self.param("Freq_stop", constant_init(self.init_dist), (1,))
-    freqs = jnp.arange(0, self.num_step) * (jnp.exp(dist) / self.num_step) + start
-
-    # Create Base 2 Fourier features
-    w = 2.**freqs * 2 * jnp.pi
-    w = jnp.tile(w[None, :], (1, inputs.shape[-1]))
-
-    # Compute features
-    h = jnp.repeat(inputs, len(freqs), axis=-1)
-    h = w * h
-    h = jnp.concatenate([jnp.sin(h), jnp.cos(h)], axis=-1)
-
-    t_feat = nn.swish(nn.Dense(features=self.n_feat)(temb))
-    four_weight = nn.Dense(features=h.shape[-1])(t_feat).reshape(-1, h.shape[-1])
-    h = h * four_weight[:,None,None,:]
-
     return h

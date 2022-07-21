@@ -74,8 +74,6 @@ def conv_gamma(gamma, f):
     ft = ft.reshape(C, H, W, N, D).transpose(3,1,2,0,4)
   return ft #/ normalizer
 
-
-
 @flax.struct.dataclass
 class VDMOutput:
   loss_recon: chex.Array  # [B]
@@ -83,6 +81,9 @@ class VDMOutput:
   loss_diff: chex.Array  # [B]
   var_0: float
   var_1: float
+  plog_p: chex.Array
+  log_q: chex.Array
+  scale: chex.Array
 
 @flax.struct.dataclass
 class VDMLog:
@@ -118,6 +119,7 @@ class VDM(nn.Module):
       self.gamma = NoiseSchedule_FFT_NNet(self.config)
     else:
       raise Exception("Unknown self.var_model")
+    self.prior_net = MAFPrior(self.config)
     
   def __call__(self, images, conditioning, T_eval, deterministic: bool = True, use_t_eval: bool = False):
     g_0, g_1 = self.gamma(0.), self.gamma(1.)
@@ -134,6 +136,7 @@ class VDM(nn.Module):
     # add noise and reconstruct
     # eps_0 = jax.random.normal(self.make_rng("sample"), shape=f.shape)
     eps_0 = self.sample_eps(self.make_rng("sample"), (f.shape[0],*self.config.gamma_shape,f.shape[-1]))
+    eps_1 = self.sample_eps(self.make_rng("sample"), (f.shape[0],*self.config.gamma_shape,f.shape[-1]))
     # eps_0 = jax.random.normal(self.make_rng("sample"), shape=self.config.gamma_shape)
     # eps_0 = eps_0 * self.config.z_std + self.config.z_mean
     # eps_0 = jnp.fft.rfft2(eps_0, axes=[1,2])
@@ -146,10 +149,21 @@ class VDM(nn.Module):
     # 2. LATENT LOSS
     # KL z1 with N(0,1) prior
     # mean1_sqr = (1. - var_1) * jnp.square(f)
+    z_1_mean = conv_gamma(jnp.sqrt(1. - var_1), f)
+    z_1_eps = conv_gamma(jnp.sqrt(var_1), eps_1)
+    z_1 =  z_1_mean + z_1_eps 
+    # mean1 = jnp.fft.rfft2(z_1_eps, axes=[1,2])
+    # mean_diff = jnp.square(mean1.real) + jnp.square(mean1.imag)
+    z_latent, scale = self.prior_net(z_1)
+    # plog_p = 0.5 * (jnp.tile(jnp.log(2 * jnp.pi * var_1 * self.z_std * 0.5), (1,1,1,2)) + 1).sum(axis=[1,2,3])
+    plog_p = -(0.5 * (1 + jnp.log(2 * jnp.pi)) + 0.5 * jnp.log(var_1).mean()) * (32 * 32 * 3)
+    log_q = jnp.sum(-0.5 * jnp.square(z_latent), axis=[1,2,3]) - 0.5 * jnp.log(jnp.pi * 2 * jnp.ones((1,32,32,3))).sum(axis=[1,2,3])
+    scale = scale.sum(axis=[1,2,3,4])
+    loss_klz = (plog_p - log_q - scale)
 
-    mean1_sqr = jnp.fft.rfft2(conv_gamma(jnp.sqrt(1. - var_1), f), axes=[1,2]) #+ (mu_1 - 1) * self.z_mean
-    mean_diff = (jnp.square(mean1_sqr.real) + jnp.square(mean1_sqr.imag))
-    loss_klz = 0.5 * jnp.sum(mean_diff / (self.z_std * 0.5) + var_1 - jnp.log(var_1) - 1, axis=(1, 2, 3))
+    # mean1_sqr = jnp.fft.rfft2(conv_gamma(jnp.sqrt(1. - var_1), f), axes=[1,2]) #+ (mu_1 - 1) * self.z_mean
+    # mean_diff = (jnp.square(mean1_sqr.real) + jnp.square(mean1_sqr.imag))
+    # loss_klz = 0.5 * jnp.sum(mean_diff / (self.z_std * 0.5) + var_1 - jnp.log(var_1) - 1, axis=(1, 2, 3))
 
     # loss_klz = jnp.fft.ifft2(loss_klz, axes=[1,2])
 
@@ -180,7 +194,7 @@ class VDM(nn.Module):
     # z_t = jnp.sqrt(1. - var_t) * f + jnp.sqrt(var_t) * eps
     z_t = conv_gamma(jnp.sqrt(1. - var_t), f) + conv_gamma(jnp.sqrt(var_t), eps) #+ jnp.fft.irfft2(mu_t * self.z_mean, axes=[1,2])
     # compute predicted noise
-    eps_hat = self.score_model(z_t, g_t, conditioning, deterministic)
+    eps_hat = self.score_model(z_t, self.uniform_timestep(g_t, g_0, g_1), conditioning, deterministic)
     # compute MSE of predicted noise
     # loss_diff_mse = jnp.sum(jnp.square(eps - eps_hat), axis=[1, 2, 3])
     loss_diff_mse = jnp.fft.rfft2(eps - eps_hat, axes=[1,2])
@@ -207,7 +221,18 @@ class VDM(nn.Module):
         loss_diff=loss_diff,
         var_0=jnp.linalg.norm(var_0) / np.sqrt(self.config.gamma_out),
         var_1=jnp.linalg.norm(var_1) / np.sqrt(self.config.gamma_out),
+        plog_p=plog_p,
+        log_q=log_q,
+        scale=scale,
     )
+  
+  def uniform_timestep(self, g_t, g_0, g_1):
+    return (g_t - g_1) / (g_0 - g_1)
+  
+  def sample_zinit(self, rng, batch):
+    rng, rng_eps = jax.random.split(rng)
+    eps = jax.random.normal(rng_eps, shape=(batch, 32, 32, 3))
+    return self.prior_net(eps, sample=True)
 
   def sample_eps(self, rng, shape, axes=[1,2], use_var1=False):
     real_rng, imag_rng = jax.random.split(rng)
@@ -405,15 +430,11 @@ class ScoreUNet(nn.Module):
   config: VDMConfig
 
   @nn.compact
-  def __call__(self, z, g_t, conditioning, deterministic=True, z_std=None):
+  def __call__(self, z, t, conditioning, deterministic=True, z_std=None):
     config = self.config
 
     # Compute conditioning vector based on 'g_t' and 'conditioning'
     n_embd = self.config.sm_n_embd
-
-    lb = config.gamma_min
-    ub = config.gamma_max
-    t = (g_t - lb) / (ub - lb)  # ---> [0,1]
 
     # assert jnp.isscalar(t) or len(t.shape) == 0 or len(t.shape) == 1
     # if jnp.isscalar(t):
@@ -425,12 +446,12 @@ class ScoreUNet(nn.Module):
     temb = get_timestep_embedding(jnp.repeat(t, G, axis=0).reshape(z.shape[0], -1), n_embd)
     cond = jnp.concatenate([temb, conditioning[:, None]], axis=1)
     cond = nn.swish(nn.Dense(features=n_embd * 4, name='dense0')(cond))
-    cond = nn.swish(nn.Dense(features=n_embd * 4, name='dense1')(cond))
+    cond = nn.Dense(features=n_embd * 4, name='dense1')(cond)
 
     # Concatenate Fourier features to input
     if config.with_fourier_features:
       z_f = Base2FourierFeatures(start=6, stop=8, step=1, z_std=z_std)(z)
-      # z_f = OptBase2FourierFeatures(init_start=6, init_dist=jnp.log(8 - 6))(z, temb)
+      # z_f = OptBase2FourierFeatures(init_start=6, init_dist=jnp.log(8 - 6))(z)
       h = jnp.concatenate([z, z_f], axis=-1)
     else:
       h = z
@@ -478,6 +499,22 @@ class ScoreUNet(nn.Module):
 
     return eps_pred
 
+def get_fourier_feature(embedding_dim: int, dtype=jnp.float32):
+  """Build sinusoidal embeddings (from Fairseq).
+
+  This matches the implementation in tensor2tensor, but differs slightly
+  from the description in Section 3.5 of "Attention Is All You Need".
+
+  Args:
+    timesteps: jnp.ndarray: generate embedding vectors at these timesteps
+    embedding_dim: int: dimension of the embeddings to generate
+    dtype: data type of the generated embeddings
+
+  Returns:
+    embedding vectors with shape `(len(timesteps), embedding_dim)`
+  """
+  # assert len(timesteps.shape) == 1
+
 
 def get_timestep_embedding(timesteps, embedding_dim: int, dtype=jnp.float32):
   """Build sinusoidal embeddings (from Fairseq).
@@ -501,12 +538,39 @@ def get_timestep_embedding(timesteps, embedding_dim: int, dtype=jnp.float32):
   # emb = jnp.exp(jnp.arange(half_dim, dtype=dtype) * -emb)
   # emb = timesteps.astype(dtype)[:, None] * emb[None, :]
   emb = DenseExp(half_dim,name='pos_dense')(timesteps.astype(dtype))
-  emb = jnp.concatenate([jnp.sin(emb), jnp.cos(emb)], axis=1)
+  emb = jnp.concatenate([jnp.sin(emb), jnp.cos(emb)], axis=-1)
   if embedding_dim % 2 == 1:  # zero pad
     emb = jax.lax.pad(emb, dtype(0), ((0, 0, 0), (0, 1, 0)))
   assert emb.shape == (timesteps.shape[0], embedding_dim)
   return emb
 
+def get_res_embedding(resolution, embedding_dim: int, dtype=jnp.float32):
+  """Build sinusoidal embeddings (from Fairseq).
+
+  This matches the implementation in tensor2tensor, but differs slightly
+  from the description in Section 3.5 of "Attention Is All You Need".
+
+  Args:
+    timesteps: jnp.ndarray: generate embedding vectors at these timesteps
+    embedding_dim: int: dimension of the embeddings to generate
+    dtype: data type of the generated embeddings
+
+  Returns:
+    embedding vectors with shape `(len(timesteps), embedding_dim)`
+  """
+  # assert len(timesteps.shape) == 1
+  resolution = resolution * 32
+
+  half_dim = embedding_dim // 2
+  # emb = np.log(10000) / (half_dim - 1)
+  # emb = jnp.exp(jnp.arange(half_dim, dtype=dtype) * -emb)
+  # emb = timesteps.astype(dtype)[:, None] * emb[None, :]
+  emb = DenseExp(half_dim,name='pos_dense')(resolution.astype(dtype))
+  emb = jnp.concatenate([jnp.sin(emb), jnp.cos(emb)], axis=1)
+  if embedding_dim % 2 == 1:  # zero pad
+    emb = jax.lax.pad(emb, dtype(0), ((0, 0, 0), (0, 1, 0)))
+  assert emb.shape == (resolution.shape[0], embedding_dim)
+  return emb
 
 ######### Noise Schedule #########
 
@@ -661,12 +725,39 @@ class DenseExp(nn.Dense):
                             precision=self.precision)
     return y
 
+class FourierFeature(nn.Module):
+  emb_dim: int = 16
+  shape: tuple = (32, 32)
+  def setup(self):
+    self.freqs = self.param('freqs', 
+                  jax.nn.initializers.uniform(1.0), (self.emb_dim, 2))
+    self.phase = self.param('phase', 
+                  jax.nn.initializers.uniform(1.0), (self.emb_dim, 1, 1))
+
+  @nn.compact
+  def __call__(self, cond, h):
+    B, H, W, C = h.shape
+    # hmean = h.mean(axis=-1).reshape(B, -1)
+    # transform = nn.Dense(self.emb_dim * 4)(hmean)
+    x, y = jnp.meshgrid(jnp.arange(W), jnp.arange(H))
+    grid = jnp.concatenate([x[...,None] / W, y[...,None] / H], axis=-1)
+    grid = jax.lax.dot_general(self.freqs - 0.5, grid, 
+                        (((1,), (2,)), ((), ()))) + self.phase - 0.5
+    cond_proj = nn.Dense(self.emb_dim, use_bias=False)(cond)
+    grid = (grid * jnp.pi * 2).transpose(1,2,0)[None,...]
+    grid = jnp.concatenate([jnp.sin(grid) * cond_proj[:,None,None,:], jnp.cos(grid) * cond_proj[:,None,None,:]], axis=-1)
+    four_feat = nn.Dense(C, use_bias=False, kernel_init=nn.initializers.zeros)(grid)
+    return four_feat * h
+
 ######### ResNet block #########
 
 class ResnetBlock(nn.Module):
   """Convolutional residual block with two convs."""
   config: VDMConfig
   out_ch: Optional[int] = None
+  
+  def setup(self):
+    self.fourier_feature = FourierFeature()
 
   @nn.compact
   def __call__(self, x, cond, deterministic: bool, enc=None):
@@ -690,9 +781,10 @@ class ResnetBlock(nn.Module):
     # add in conditioning
     if cond is not None:
       assert cond.shape[0] == B and len(cond.shape) == 2
-      h += nn.Dense(
-          features=out_ch, use_bias=False, kernel_init=nn.initializers.zeros,
-          name='cond_proj')(cond)[:, None, None, :]
+      # h += nn.Dense(
+      #     features=out_ch, use_bias=False, kernel_init=nn.initializers.zeros,
+      #     name='cond_proj')(cond)[:, None, None, :]
+      h += self.fourier_feature(cond, h)
 
     h = nonlinearity(normalize2(h))
     h = nn.Dropout(rate=config.sm_pdrop)(h, deterministic=deterministic)
@@ -888,10 +980,12 @@ class OptBase2FourierFeatures(nn.Module):
   n_feat: int = 128
 
   @nn.compact
-  def __call__(self, inputs, temb):
+  def __call__(self, inputs):
     start = self.param("Freq_start", constant_init(self.init_start), (1,))
     dist = self.param("Freq_stop", constant_init(self.init_dist), (1,))
     freqs = jnp.arange(0, self.num_step) * (jnp.exp(dist) / self.num_step) + start
+    n_emb = (self.num_step * inputs.shape[-1] * 2)
+    four_weight = self.param("four_weight", nn.initializers.normal(1.0), (n_emb,))
 
     # Create Base 2 Fourier features
     w = 2.**freqs * 2 * jnp.pi
@@ -902,8 +996,109 @@ class OptBase2FourierFeatures(nn.Module):
     h = w * h
     h = jnp.concatenate([jnp.sin(h), jnp.cos(h)], axis=-1)
 
-    t_feat = nn.swish(nn.Dense(features=self.n_feat)(temb))
-    four_weight = nn.Dense(features=h.shape[-1])(t_feat).reshape(-1, h.shape[-1])
-    h = h * four_weight[:,None,None,:]
+    # t_feat = nn.swish(nn.Dense(features=self.n_feat)(temb))
+    # four_weight = nn.Dense(features=h.shape[-1])(t_feat).reshape(-1, h.shape[-1])
+    # h = h * four_weight[:,None,None,:]
+    h = h * (four_weight[None, None, None, :]) / jnp.sqrt(2)
 
     return h
+
+class MAFPrior(nn.Module):
+  config: VDMConfig
+  Resolution: int = 32
+  num_res: int = 6
+
+  def setup(self):
+    stop = np.log2(self.Resolution/np.sqrt(2))
+    self.ri_dist = np.arange(1, stop, (stop - 1)/self.num_res).tolist()
+
+  @nn.compact
+  def __call__(self, x, sample=False):  
+
+    if sample:
+      for ri in range(self.num_res):
+        ARblock = ResNetAR(self.config, self.Resolution, 
+                  (1, self.Resolution, self.Resolution // 2 + 1, 3), self.ri_dist[ri], name=f'ARblock_{ri}')
+        x = ARblock(x, reverse=sample)
+      return x
+    else:
+      # Split x per resolution
+      log_scale_list = []
+      for ri in range(self.num_res - 1, -1, -1):
+        ARblock = ResNetAR(self.config, self.Resolution, 
+                  (1, self.Resolution, self.Resolution // 2 + 1, 3), self.ri_dist[ri], name=f'ARblock_{ri}')
+        x, log_scale = ARblock(x, reverse=sample)
+        log_scale_list.append(log_scale[:,None,...])
+      log_scale_list = jnp.concatenate(log_scale_list, axis=1)
+      return x, log_scale_list
+
+class ResNetAR(nn.Module):
+  config: VDMConfig
+  Resolution: int
+  mask_shape: tuple
+  cond_dist: float
+
+  def setup(self):
+    mask_shape = self.mask_shape
+    # num_res = np.log2(self.Resolution).astype(int)
+    cond_mask = np.zeros(mask_shape)
+    xind = np.tile((np.fft.fftfreq(32) * 32).reshape(1, -1, 1), (mask_shape[2], 1, 1))
+    yind = np.tile((np.fft.rfftfreq(32) * 32).reshape(-1, 1, 1), (1, mask_shape[1], 1))
+    dist = np.sqrt(np.square(np.concatenate([xind, yind], axis=-1)).sum(axis=-1)).transpose(1,0)[None,...]
+    cond_shape = cond_mask[dist < self.cond_dist,:].shape
+    cond_mask[dist < self.cond_dist,:] = np.ones(cond_shape)
+    
+    self.cond_mask = jnp.array(cond_mask)
+    self.scale_coef = self.param('scale_coef', constant_init(jnp.log(1/(2 * self.Resolution))), (mask_shape))
+
+  @nn.compact
+  def __call__(self, x, reverse, deterministic=True):
+    config = self.config
+    n_embd = self.config.sm_n_embd
+
+    fft_x = jnp.fft.rfft2(x, axes=[1,2])
+    x_cond, x_trg = fft_x * self.cond_mask, fft_x * (1 - self.cond_mask)
+    # x_cond, x_trg = jnp.fft.irfft2(x_cond, axes=[1,2]), jnp.fft.irfft2(x_trg, axes=[1,2])
+    x_cond_p = jnp.fft.irfft2(x_cond, axes=[1,2])
+
+    mu_block1 = ResnetBlock(config, out_ch=n_embd, name=f'AR.block_mu1')
+    # mu_attn = AttnBlock(num_heads=1, name='AR.attn_mu')
+    # mu_block2 = ResnetBlock(config, out_ch=n_embd, name=f'AR.block_mu2')
+
+    scale_block1 = ResnetBlock(config, out_ch=n_embd, name=f'AR.block_scale1')
+    # scale_attn = AttnBlock(num_heads=1, name='AR.attn_scale')
+    # scale_block2 = ResnetBlock(config, out_ch=n_embd, name=f'AR.block_scale2')
+
+    x_cond_f = OptBase2FourierFeatures(init_start=6, init_dist=jnp.log(8 - 6))(x_cond_p)
+    # x_cond_f = Base2FourierFeatures(start=6, stop=8, step=1)(x_cond_p)
+    # z_f = Base2FourierFeatures(start=6, stop=8, step=1, z_std=z_std)(z)
+    h = jnp.concatenate([x_cond_p, x_cond_f], axis=-1)
+
+    # Linear projection of input
+    h = nn.Conv(features=n_embd, kernel_size=(
+        3, 3), strides=(1, 1), name='conv_in')(h)
+
+    mu_h = mu_block1(h, None, deterministic)[0]
+    # mu_h = mu_attn(mu_h)
+    # mu_h = mu_block2(mu_h, None, deterministic)[0]
+
+    scale_h = scale_block1(h, None, deterministic)[0]
+    # scale_h = scale_attn(scale_h)
+    # scale_h = scale_block2(scale_h, None, deterministic)[0]
+
+    mu = nn.Conv(features=3, kernel_size=(
+        3, 3), strides=(1, 1), name='conv_mu')(mu_h)
+    scale = nn.Conv(features=3, kernel_size=(
+        3, 3), strides=(1, 1), name='conv_scale')(scale_h)
+    
+    mu_fft = jnp.fft.rfft2(mu, axes=[1,2]) * (1 - self.cond_mask)
+    scale_fft = jnp.fft.rfft2(scale, axes=[1,2]) * (1 - self.cond_mask) * jnp.exp(self.scale_coef)
+
+    if reverse:
+      x_trg = jax.lax.complex(x_trg.real * jnp.exp(scale_fft.real), x_trg.imag * jnp.exp(scale_fft.imag))
+      x_trg = x_trg + mu_fft
+      return jnp.fft.irfft2(x_cond + x_trg, axes=[1,2])
+    else:
+      x_trg_mu = x_trg - mu_fft
+      x_trg = jax.lax.complex(x_trg_mu.real * jnp.exp(-scale_fft.real), x_trg_mu.imag * jnp.exp(-scale_fft.imag))
+      return jnp.fft.irfft2(x_cond + x_trg, axes=[1,2]), -jnp.concatenate([scale_fft.real, scale_fft.imag], axis=-1)

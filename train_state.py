@@ -60,13 +60,15 @@ class TrainState(struct.PyTreeNode):
   """
   step: int
   params: core.FrozenDict[str, Any]
+  batch_stats: core.FrozenDict[str, Any]
   ema_params: core.FrozenDict[str, Any]
+  ema_batch_stats: core.FrozenDict[str, Any]
   opt_state: optax.OptState
   tx_fn: Callable[[float], optax.GradientTransformation] = struct.field(
       pytree_node=False)
   apply_fn: Callable = struct.field(pytree_node=False)
 
-  def apply_gradients(self, *, grads, lr, ema_rate, **kwargs):
+  def apply_gradients(self, *, grads, lr, ema_rate, stat_update, **kwargs):
     """Updates `step`, `params`, `opt_state` and `**kwargs` in return value.
 
     Note that internally this function calls `.tx.update()` followed by a call
@@ -91,25 +93,42 @@ class TrainState(struct.PyTreeNode):
         new_params,
     )
 
+    if stat_update is not None:
+      batch_stats = self.batch_stats.copy(stat_update)
+      ema_batch_stats = jax.tree_multimap(
+          lambda x, y: x + (1. - ema_rate) * (y - x),
+          self.ema_batch_stats,
+          batch_stats,
+      ) 
+    else:
+      batch_stats = self.batch_stats
+      ema_batch_stats = self.ema_batch_stats
+
     return self.replace(
         step=self.step + 1,
         params=new_params,
+        batch_stats=batch_stats,
+        ema_batch_stats=ema_batch_stats,
         ema_params=new_ema_params,
         opt_state=new_opt_state,
         **kwargs,
     )
-
+  
   @classmethod
   def create(_class, *, apply_fn, variables, optax_optimizer, **kwargs):
     """Creates a new instance with `step=0` and initialized `opt_state`."""
     # _class is the TrainState class
     params = variables["params"]
+    batch_stats = variables["batch_stats"] if "batch_stats" in variables else None
     opt_state = optax_optimizer(1.).init(params)
     ema_params = copy.deepcopy(params)
+    ema_batch_stats = copy.deepcopy(batch_stats)
     return _class(
         step=0,
         apply_fn=apply_fn,
         params=params,
+        batch_stats=batch_stats,
+        ema_batch_stats=ema_batch_stats,
         ema_params=ema_params,
         tx_fn=optax_optimizer,
         opt_state=opt_state,

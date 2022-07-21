@@ -218,16 +218,22 @@ class VDM(nn.Module):
     )
   
 
-  def sample(self, i, T, z_t, conditioning, rng):
+  def sample(self, i, T, z_t, conditioning, rng, dummy):
     rng_body = jax.random.fold_in(rng, i)
+    rng_body, rng_z_t = jax.random.split(rng_body)
+
     eps = jax.random.normal(rng_body, z_t.shape)
+    eps_z_t = jax.random.normal(rng_z_t, z_t.shape)
 
     # t = ((T - i) / T) ** (0.05)
     # s = ((T - i - 1) / T) ** (0.05)
     t = ((T - i) / T) 
     s = ((T - i - 1) / T) 
-
     g_s, g_t = self.gamma(s), self.gamma(t)
+
+    alpha_t, sigma_t = jnp.sqrt(nn.sigmoid(-g_t)), jnp.sqrt(nn.sigmoid(g_t))
+    z_t = dummy * alpha_t + eps_z_t * sigma_t
+
     eps_hat = self.score_model(
         z_t,
         g_t * jnp.ones((z_t.shape[0],), g_t.dtype),
@@ -237,18 +243,33 @@ class VDM(nn.Module):
     b = nn.sigmoid(-g_t)
     c = - jnp.expm1(g_s - g_t)
     sigma_t = jnp.sqrt(nn.sigmoid(g_t))
+    var_t = sigma_t ** 2
 
     # z_s = jnp.sqrt(nn.sigmoid(-g_s) / nn.sigmoid(-g_t)) * (z_t - sigma_t * c * eps_hat) + \
     #     jnp.sqrt((1. - a) * c) * eps
 
     # z_s = jnp.sqrt(nn.sigmoid(-g_s) / nn.sigmoid(-g_t)) * (z_t - sigma_t * eps_hat) + jnp.sqrt(nn.sigmoid(g_s)) * eps
 
+    recon = (z_t - jnp.sqrt(var_t) * eps_hat) / jnp.sqrt(1 - var_t)
     z_t_coeff = jnp.sqrt(nn.sigmoid(-g_s) / nn.sigmoid(-g_t)) * z_t
-    eps = jnp.sqrt((1. - a) * c) * eps
-    eps_hat = jnp.sqrt(nn.sigmoid(-g_s) / nn.sigmoid(-g_t)) * ( - sigma_t * c * eps_hat)
-    z_s = z_t_coeff + eps + eps_hat
+    eps_ = jnp.sqrt((1. - a) * c) * eps
+    eps_hat_ = jnp.sqrt(nn.sigmoid(-g_s) / nn.sigmoid(-g_t)) * ( - sigma_t * c * eps_hat)
+    z_s = z_t_coeff + eps_ + eps_hat_
 
-    return z_s #, z_t_coeff, eps_hat, eps
+    # results = {
+    #   "z_s" : z_s
+    # }
+    results = {
+      "z_s": z_s,
+      "z_t": z_t,
+      "g_t" : g_t,
+      "g_s" : g_s,
+      "eps" : eps,
+      "eps_hat": eps_hat,
+      "recon": recon
+    }
+
+    return results #, z_t_coeff, eps_hat, eps
 
   def generate_x(self, z_0):
     g_0 = self.gamma(0.)
